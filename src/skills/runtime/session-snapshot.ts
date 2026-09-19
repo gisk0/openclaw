@@ -9,6 +9,7 @@ import { WORKSPACE_SKILLS_PROMPT_FORMAT_VERSION } from "../types.js";
 import type { SkillEligibilityContext, SkillSnapshot } from "../types.js";
 import {
   getSkillsSnapshotVersion,
+  getSkillsResourceVersion,
   getSkillsSourceVersion,
   shouldRefreshSnapshotForVersion,
 } from "./refresh-state.js";
@@ -94,6 +95,12 @@ export async function resolveReusableWorkspaceSkillSnapshot(
   const nodeSkillsEligibilityChanged =
     stableStringify(params.existingSnapshot?.nodeSkillsEligibility) !==
     stableStringify(eligibility?.nodeSkills);
+  const resourceVersion = getSkillsResourceVersion(watcherWorkspaceDir, {
+    executionWorkspaceDir: skillRoots?.executionWorkspaceDir,
+  });
+  const verifiedResourceChanged =
+    params.existingSnapshot?.resourceVersion !== undefined &&
+    params.existingSnapshot.resourceVersion !== resourceVersion;
   const skillOverridesChanged =
     stableStringify(params.existingSnapshot?.skillOverrides) !==
     stableStringify(params.skillOverrides);
@@ -108,6 +115,7 @@ export async function resolveReusableWorkspaceSkillSnapshot(
     promptFormatChanged ||
     skillVersionChanged ||
     nodeSkillsEligibilityChanged ||
+    verifiedResourceChanged ||
     skillRootsChanged ||
     !matchesSkillFilter(params.existingSnapshot?.skillFilter, params.skillFilter) ||
     skillOverridesChanged;
@@ -127,6 +135,7 @@ export async function resolveReusableWorkspaceSkillSnapshot(
   const eligibilityKey = stableStringify(eligibility);
   const projectionIsCurrent = () =>
     getSkillsSourceVersion(watcherWorkspaceDir, sourceScope) === sourceVersion &&
+    getSkillsResourceVersion(watcherWorkspaceDir, sourceScope) === resourceVersion &&
     getSkillsSnapshotVersion(watcherWorkspaceDir) === effectiveVersion &&
     stableStringify(params.resolveEligibility?.() ?? params.eligibility) === eligibilityKey;
   const buildSnapshot = async (assertCurrent: () => void) => {
@@ -160,6 +169,7 @@ export async function resolveReusableWorkspaceSkillSnapshot(
       params.skillOverrides,
       params.agentId,
       eligibility,
+      resourceVersion,
       fingerprintSkillSnapshotConfig(params.config),
     ]);
 

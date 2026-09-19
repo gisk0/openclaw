@@ -395,12 +395,24 @@ describe("runNodeHost", () => {
     }
   });
 
-  it("publishes node-hosted skills after gateway hello succeeds", async () => {
+  it.each([
+    {
+      name: "strips revisions for a legacy Gateway",
+      capabilities: undefined,
+      expectedRevision: undefined,
+    },
+    {
+      name: "publishes revisions to a capable Gateway",
+      capabilities: [GATEWAY_SERVER_CAPS.NODE_SKILL_REVISIONS],
+      expectedRevision: "a".repeat(64),
+    },
+  ])("publishes node-hosted skills after gateway hello succeeds: $name", async (testCase) => {
     mocks.nodeSkillDescriptors = [
       {
         name: "release-helper",
         description: "Prepare a release",
         content: "---\nname: release-helper\ndescription: Prepare a release\n---\n",
+        revision: "a".repeat(64),
       },
     ];
 
@@ -415,10 +427,21 @@ describe("runNodeHost", () => {
     );
     options?.onHelloOk?.({
       protocol: 1,
-      features: { methods: [NODE_SKILLS_UPDATE_METHOD], events: [] },
+      features: {
+        methods: [NODE_SKILLS_UPDATE_METHOD],
+        events: [],
+        ...(testCase.capabilities ? { capabilities: testCase.capabilities } : {}),
+      },
     } as unknown as Parameters<NonNullable<GatewayClientOptions["onHelloOk"]>>[0]);
     expect(mocks.capturedGatewayClients[0]?.request).toHaveBeenCalledWith("node.skills.update", {
-      skills: mocks.nodeSkillDescriptors,
+      skills: [
+        {
+          name: "release-helper",
+          description: "Prepare a release",
+          content: "---\nname: release-helper\ndescription: Prepare a release\n---\n",
+          ...(testCase.expectedRevision ? { revision: testCase.expectedRevision } : {}),
+        },
+      ],
     });
   });
 

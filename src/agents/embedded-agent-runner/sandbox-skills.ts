@@ -227,14 +227,3 @@ export function resolveSandboxSkillRuntimeInputs(params: {
     workspaceOnly: false,
   };
 }
-
-/** Rewrites host-generated explicit skill references to the prepared runtime's exact copies. */
-export function remapSkillReferencePaths(
-  text: string,
-  paths?: readonly Pick<SkillUsagePath, "skillFile" | "readPath">[],
-): string {
-  return (paths ?? []).reduce(
-    (result, item) => result.replaceAll(item.skillFile, item.readPath),
-    text,
-  );
-}

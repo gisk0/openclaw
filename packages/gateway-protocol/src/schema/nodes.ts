@@ -136,6 +136,8 @@ export const NodeSkillDescriptorSchema = closedObject({
   name: NodeSkillNameSchema,
   description: Type.String({ minLength: 1, maxLength: 1024 }),
   content: Type.String({ minLength: 1, maxLength: 64 * 1024 }),
+  // Gateways treat unknown encodings as an absent revision, preserving legacy delivery.
+  revision: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
 
 /** Replaces the connected node's agent-visible skill catalog. */

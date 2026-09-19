@@ -3,6 +3,7 @@ import {
   OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST,
 } from "../../../context-engine/host-compat.js";
 import { resolveContextEngineOwnerPluginId } from "../../../context-engine/registry.js";
+import { hasSkillRefs, remapSkillRefs } from "../../../skills/reference-paths.js";
 import { resolveAdmittedRunActiveAssertion } from "../../admitted-run-context.js";
 import { createBundleLspToolRuntime } from "../../agent-bundle-lsp-runtime.js";
 import { materializeBundleMcpToolsForRun } from "../../agent-bundle-mcp-tools.js";
@@ -20,7 +21,6 @@ import {
   type ToolSearchCatalogToolExecutor,
 } from "../../tool-search.js";
 import { log } from "../logger.js";
-import { remapSkillReferencePaths } from "../sandbox-skills.js";
 import { prepareEmbeddedSkills } from "../skill-runtime.js";
 import { prepareEmbeddedAttemptBootstrap } from "./attempt-bootstrap-prepare.js";
 import { prepareEmbeddedAttemptBundleTools } from "./attempt-bundle-tools.js";
@@ -159,8 +159,8 @@ export async function runEmbeddedAttempt(
       skillsPrompt,
       skillsSnapshotForRun,
     } = preparedSkills;
-    if (params.skillsSnapshot?.librarySelections?.length && sandbox?.enabled) {
-      const remapped = remapSkillReferencePaths(params.prompt, skillUsagePaths);
+    if (hasSkillRefs(params.skillsSnapshot, sandbox?.enabled === true)) {
+      const remapped = remapSkillRefs(params.prompt, skillUsagePaths, params.skillsSnapshot);
       if (remapped !== params.prompt) {
         params = {
           ...params,

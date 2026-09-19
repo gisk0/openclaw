@@ -58,37 +58,68 @@ describe("scanNodeHostedSkills", () => {
     }
   });
 
-  it("uses the active OpenClaw profile skills directory by default", () => {
+  it("uses the active OpenClaw profile skills directory by default", async () => {
     const stateDir = createRoot();
     const content = writeSkill(path.join(stateDir, "skills"), "profile-skill", "Profile skill");
     vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
 
-    expect(scanNodeHostedSkills()).toEqual([
-      { name: "profile-skill", description: "Profile skill", content },
+    expect(await scanNodeHostedSkills()).toEqual([
+      {
+        name: "profile-skill",
+        description: "Profile skill",
+        content,
+        revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
     ]);
   });
 
-  it("treats a missing skills directory as an empty fresh-node inventory", () => {
+  it("treats a missing skills directory as an empty fresh-node inventory", async () => {
     const warn = vi.fn();
 
-    expect(scanNodeHostedSkills({ skillsDir: path.join(createRoot(), "missing"), warn })).toEqual(
-      [],
-    );
+    expect(
+      await scanNodeHostedSkills({ skillsDir: path.join(createRoot(), "missing"), warn }),
+    ).toEqual([]);
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("loads complete descriptors in skill-name order", () => {
+  it("loads complete descriptors in skill-name order", async () => {
     const root = createRoot();
     const content = writeSkill(root, "release-helper", "Prepare a release", "# Release\nDo it.");
     const prefixContent = writeSkill(root, "release", "Release", "# Prefix skill");
 
-    expect(scanNodeHostedSkills({ skillsDir: root })).toEqual([
-      { name: "release", description: "Release", content: prefixContent },
-      { name: "release-helper", description: "Prepare a release", content },
+    expect(await scanNodeHostedSkills({ skillsDir: root })).toEqual([
+      {
+        name: "release",
+        description: "Release",
+        content: prefixContent,
+        revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+      {
+        name: "release-helper",
+        description: "Prepare a release",
+        content,
+        revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
     ]);
   });
 
-  it("publishes the same bounded content that supplied the skill metadata", () => {
+  it("revises the complete safe tree when only a support file changes", async () => {
+    const root = createRoot();
+    writeSkill(root, "release", "Release");
+    const supportPath = path.join(root, "release", "scripts", "check.sh");
+    fs.mkdirSync(path.dirname(supportPath));
+    fs.writeFileSync(supportPath, "before");
+
+    const before = await scanNodeHostedSkills({ skillsDir: root });
+    expect(await scanNodeHostedSkills({ skillsDir: root })).toEqual(before);
+    fs.writeFileSync(supportPath, "after");
+    const after = await scanNodeHostedSkills({ skillsDir: root });
+
+    expect(before[0]?.content).toBe(after[0]?.content);
+    expect(before[0]?.revision).not.toBe(after[0]?.revision);
+  });
+
+  it("publishes the same bounded content that supplied the skill metadata", async () => {
     const root = createRoot();
     const original = writeSkill(root, "a-stable", "Original description", "# Original");
     const invalidDir = path.join(root, "b-invalid");
@@ -101,13 +132,18 @@ describe("scanNodeHostedSkills", () => {
       }
     });
 
-    expect(scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([
-      { name: "a-stable", description: "Original description", content: original },
+    expect(await scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([
+      {
+        name: "a-stable",
+        description: "Original description",
+        content: original,
+        revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
     ]);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(invalidFile));
   });
 
-  it("loads JSON5-style metadata frontmatter", () => {
+  it("loads JSON5-style metadata frontmatter", async () => {
     const root = createRoot();
     const skillDir = path.join(root, "json5-metadata");
     fs.mkdirSync(skillDir);
@@ -128,12 +164,17 @@ metadata:
 `;
     fs.writeFileSync(path.join(skillDir, "SKILL.md"), content);
 
-    expect(scanNodeHostedSkills({ skillsDir: root })).toEqual([
-      { name: "json5-metadata", description: "JSON5-style metadata", content },
+    expect(await scanNodeHostedSkills({ skillsDir: root })).toEqual([
+      {
+        name: "json5-metadata",
+        description: "JSON5-style metadata",
+        content,
+        revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
     ]);
   });
 
-  it("skips invalid and oversized skills with warnings", () => {
+  it("skips invalid and oversized skills with warnings", async () => {
     const root = createRoot();
     writeSkill(root, "valid-skill", "Valid");
     const invalidDir = path.join(root, "invalid");
@@ -155,7 +196,7 @@ metadata:
     );
     const warn = vi.fn();
 
-    const skills = scanNodeHostedSkills({ skillsDir: root, warn });
+    const skills = await scanNodeHostedSkills({ skillsDir: root, warn });
 
     expect(skills.map((skill) => skill.name)).toEqual(["valid-skill"]);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("description is required"));
@@ -165,7 +206,7 @@ metadata:
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("directory, name, and frontmatter"));
   });
 
-  it("does not inspect nested skills after rejecting the named candidate", () => {
+  it("does not inspect nested skills after rejecting the named candidate", async () => {
     const root = createRoot();
     const candidateDir = path.join(root, "candidate");
     fs.mkdirSync(path.join(candidateDir, "nested"), { recursive: true });
@@ -175,14 +216,14 @@ metadata:
     fs.writeFileSync(nestedFile, "---\nname: [nested\ndescription: Malformed nested skill\n---\n");
     const warn = vi.fn();
 
-    expect(scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([]);
+    expect(await scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([]);
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining(nestedFile));
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining(`${candidateFile}): description is required`),
     );
   });
 
-  it("rejects a root-level skill because its node locator is not representable", () => {
+  it("rejects a root-level skill because its node locator is not representable", async () => {
     const root = path.join(createRoot(), "skills");
     fs.mkdirSync(root);
     const childContent = writeSkill(root, "valid-child", "Valid child");
@@ -192,13 +233,18 @@ metadata:
     );
     const warn = vi.fn();
 
-    expect(scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([
-      { name: "valid-child", description: "Valid child", content: childContent },
+    expect(await scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([
+      {
+        name: "valid-child",
+        description: "Valid child",
+        content: childContent,
+        revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
     ]);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("named child directory"));
   });
 
-  it("warns and continues when the optional root skill cannot be inspected", () => {
+  it("warns and continues when the optional root skill cannot be inspected", async () => {
     const root = createRoot();
     const childContent = writeSkill(root, "valid-child", "Valid child");
     fs.symlinkSync("SKILL.md", path.join(root, "SKILL.md"));
@@ -207,20 +253,25 @@ metadata:
     fs.symlinkSync("SKILL.md", path.join(brokenDir, "SKILL.md"));
     const warn = vi.fn();
 
-    expect(scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([
-      { name: "valid-child", description: "Valid child", content: childContent },
+    expect(await scanNodeHostedSkills({ skillsDir: root, warn })).toEqual([
+      {
+        name: "valid-child",
+        description: "Valid child",
+        content: childContent,
+        revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
     ]);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("skill scan skipped"));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("broken-child/SKILL.md"));
   });
 
-  it("enforces count and total-content caps", () => {
+  it("enforces count and total-content caps", async () => {
     const countRoot = createRoot();
     for (let index = 0; index < 65; index += 1) {
       writeSkill(countRoot, `count-${String(index).padStart(2, "0")}`, "Counted");
     }
     const countWarn = vi.fn();
-    expect(scanNodeHostedSkills({ skillsDir: countRoot, warn: countWarn })).toHaveLength(64);
+    expect(await scanNodeHostedSkills({ skillsDir: countRoot, warn: countWarn })).toHaveLength(64);
     expect(countWarn).toHaveBeenCalledWith(expect.stringContaining("exceeds 64 skills"));
 
     const totalRoot = createRoot();
@@ -233,7 +284,7 @@ metadata:
       );
     }
     const totalWarn = vi.fn();
-    expect(scanNodeHostedSkills({ skillsDir: totalRoot, warn: totalWarn })).toHaveLength(8);
+    expect(await scanNodeHostedSkills({ skillsDir: totalRoot, warn: totalWarn })).toHaveLength(8);
     expect(totalWarn).toHaveBeenCalledWith(expect.stringContaining("exceeds 524288 total bytes"));
   });
 });

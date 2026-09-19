@@ -304,7 +304,9 @@ export async function prepareNodeHostRuntime(params?: {
     }
   }
   const skills =
-    commandAllowlist || config.nodeHost?.skills?.enabled === false ? null : scanNodeHostedSkills();
+    commandAllowlist || config.nodeHost?.skills?.enabled === false
+      ? null
+      : await scanNodeHostedSkills();
   const buildManifest = (pluginManifest: typeof pluginNodeHost) =>
     buildNodeHostManifest({
       pluginManifest,

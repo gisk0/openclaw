@@ -7,9 +7,14 @@ import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
 import { loggingState } from "../../logging/state.js";
 import { loadWorkspaceSkills } from "../loading/workspace-skill-loader.js";
 import { buildSkillSnapshot } from "../loading/workspace-skill-prompt.js";
+import { markSkillsSupportingFilesChanged } from "./refresh-state.js";
+import { recordRemoteSkillNodeInfo, replaceRemoteNodeSkills } from "./remote-skills.js";
+import { resetRemoteNodeSkillsForTests } from "./remote-skills.test-support.js";
 import { materializeSkillResources, prepareSkillResourceDelivery } from "./resources.js";
+import { resolveReusableWorkspaceSkillSnapshot } from "./session-snapshot.js";
 
 const temps = useAutoCleanupTempDirTracker(afterEach);
+afterEach(resetRemoteNodeSkillsForTests);
 const markdown = "---\ndescription: Workspace procedure\n---\n# Guide\nRun scripts/check.sh.\n";
 async function writeSkill(workspace: string, name: string, content = markdown) {
   const directory = path.join(workspace, "skills", name);
@@ -23,6 +28,323 @@ async function loadSnapshot(workspace: string) {
 }
 
 describe("prepared workspace skill resources", () => {
+  it("reuses an exact bound-node skill without delivering its tree", async () => {
+    const workspace = await fs.realpath(temps.make("skill-node-reuse-"));
+    const content = "---\nname: shared\ndescription: Shared procedure\n---\n# Shared\n";
+    const directory = await writeSkill(workspace, "shared", content);
+    await fs.writeFile(path.join(directory, "support.txt"), "same support");
+    const localSnapshot = await loadSnapshot(workspace);
+    const revision = (await prepareSkillResourceDelivery(localSnapshot, () => {}))!.skills[0]!
+      .revision;
+    recordRemoteSkillNodeInfo({
+      nodeId: "node-1",
+      connId: "conn-1",
+      commands: ["system.run"],
+    });
+    replaceRemoteNodeSkills({
+      nodeId: "node-1",
+      skills: [{ name: "shared", description: "Shared procedure", content, revision }],
+    });
+    const eligibility = { nodeSkills: { canExec: true, node: "node-1" } };
+    const snapshot = await buildSkillSnapshot(workspace, {
+      entries: loadWorkspaceSkills(workspace, { workspaceOnly: true, eligibility }),
+      eligibility,
+    });
+
+    expect(snapshot.resolvedSkills).toMatchObject([
+      { name: "shared", filePath: "node://node-1/skills/shared/SKILL.md" },
+    ]);
+    expect(snapshot.nodeSkillReferencePaths).toEqual([
+      {
+        skillFile: path.join(directory, "SKILL.md"),
+        readPath: "node://node-1/skills/shared/SKILL.md",
+        skillName: "shared",
+        skillSource: "workspace",
+      },
+    ]);
+    expect((await prepareSkillResourceDelivery(snapshot, () => {}))?.skills).toEqual([]);
+    expect(
+      (
+        await prepareSkillResourceDelivery(snapshot, () => {}, [
+          { name: "shared", path: path.join(directory, "SKILL.md") },
+        ])
+      )?.skills,
+    ).toEqual([]);
+  });
+
+  it("preserves Gateway identity when a hidden exact match is selected explicitly", async () => {
+    const workspace = await fs.realpath(temps.make("skill-node-hidden-"));
+    const content = `---
+name: hidden
+description: Hidden procedure
+disable-model-invocation: true
+metadata: ${JSON.stringify({ openclaw: { skillKey: "canonical-hidden" } })}
+---
+# Hidden
+`;
+    const directory = await writeSkill(workspace, "hidden", content);
+    const localEntries = loadWorkspaceSkills(workspace, { workspaceOnly: true });
+    const localSnapshot = await buildSkillSnapshot(workspace, { entries: localEntries });
+    const revision = (await prepareSkillResourceDelivery(localSnapshot, () => {}, [
+      { name: "hidden", path: path.join(directory, "SKILL.md") },
+    ]))!.skills[0]!.revision;
+    recordRemoteSkillNodeInfo({
+      nodeId: "node-1",
+      connId: "conn-1",
+      commands: ["system.run"],
+    });
+    replaceRemoteNodeSkills({
+      nodeId: "node-1",
+      skills: [{ name: "hidden", description: "Hidden procedure", content, revision }],
+    });
+    const eligibility = { nodeSkills: { canExec: true, node: "node-1" } };
+    const snapshot = await buildSkillSnapshot(workspace, {
+      entries: loadWorkspaceSkills(workspace, { workspaceOnly: true, eligibility }),
+      eligibility,
+    });
+
+    expect(snapshot.prompt).not.toContain("<name>hidden</name>");
+    expect(snapshot.skills).toEqual([
+      expect.objectContaining({ name: "hidden", skillKey: "canonical-hidden" }),
+    ]);
+    expect(snapshot.nodeSkillReferencePaths).toEqual([
+      expect.objectContaining({
+        skillFile: path.join(directory, "SKILL.md"),
+        readPath: "node://node-1/skills/hidden/SKILL.md",
+      }),
+    ]);
+    expect(
+      (
+        await prepareSkillResourceDelivery(snapshot, () => {}, [
+          { name: "hidden", path: path.join(directory, "SKILL.md") },
+        ])
+      )?.skills,
+    ).toEqual([]);
+  });
+
+  it("keeps an execution-local collision canonical when the node revision is absent", async () => {
+    const agentWorkspace = await fs.realpath(temps.make("skill-node-agent-root-"));
+    const executionWorkspace = await fs.realpath(temps.make("skill-node-execution-root-"));
+    const content = "---\nname: shared\ndescription: Execution procedure\n---\n# Local\n";
+    await writeSkill(executionWorkspace, "shared", content);
+    recordRemoteSkillNodeInfo({
+      nodeId: "node-1",
+      connId: "conn-1",
+      commands: ["system.run"],
+    });
+    replaceRemoteNodeSkills({
+      nodeId: "node-1",
+      skills: [{ name: "shared", description: "Execution procedure", content }],
+    });
+    const eligibility = { nodeSkills: { canExec: true, node: "node-1" } };
+    const snapshot = await buildSkillSnapshot(agentWorkspace, {
+      executionWorkspaceDir: executionWorkspace,
+      skillFilter: ["shared", "node-1-shared"],
+      eligibility,
+    });
+
+    expect(snapshot.resolvedSkills?.map((skill) => skill.name)).toEqual([
+      "node-1-shared",
+      "shared",
+    ]);
+    expect(snapshot.resolvedSkills?.find((skill) => skill.name === "shared")?.filePath).toBe(
+      path.join(executionWorkspace, "skills", "shared", "SKILL.md"),
+    );
+    expect((await prepareSkillResourceDelivery(snapshot, () => {}))?.skills).toMatchObject([
+      { name: "shared" },
+    ]);
+  });
+
+  it("preserves agent-before-execution order when no node tree is substituted", async () => {
+    const agentWorkspace = await fs.realpath(temps.make("skill-order-agent-root-"));
+    const executionWorkspace = await fs.realpath(temps.make("skill-order-execution-root-"));
+    await writeSkill(
+      agentWorkspace,
+      "z-agent-priority",
+      "---\nname: z-agent-priority\ndescription: Agent priority\n---\n",
+    );
+    await writeSkill(
+      executionWorkspace,
+      "a-execution-priority",
+      "---\nname: a-execution-priority\ndescription: Execution priority\n---\n",
+    );
+    recordRemoteSkillNodeInfo({
+      nodeId: "node-1",
+      connId: "conn-1",
+      commands: ["system.run"],
+    });
+    replaceRemoteNodeSkills({ nodeId: "node-1", skills: [] });
+    const eligibility = { nodeSkills: { canExec: true, node: "node-1" } };
+    const snapshot = await buildSkillSnapshot(agentWorkspace, {
+      executionWorkspaceDir: executionWorkspace,
+      config: { skills: { limits: { maxSkillsInPrompt: 1 } } },
+      skillFilter: ["z-agent-priority", "a-execution-priority"],
+      eligibility,
+      preserveEntryOrder: true,
+    });
+
+    expect(snapshot.prompt).toContain("<name>z-agent-priority</name>");
+    expect(snapshot.prompt).not.toContain("<name>a-execution-priority</name>");
+  });
+
+  it.each([
+    ["mismatched", "0".repeat(64)],
+    ["legacy", undefined],
+    ["malformed", "not-a-revision"],
+  ] as const)("keeps Gateway delivery for a %s node revision", async (_kind, revision) => {
+    const workspace = await fs.realpath(temps.make("skill-node-fallback-"));
+    const content = "---\nname: shared\ndescription: Shared procedure\n---\n# Shared\n";
+    await writeSkill(workspace, "shared", content);
+    recordRemoteSkillNodeInfo({
+      nodeId: "node-1",
+      connId: "conn-1",
+      commands: ["system.run"],
+    });
+    replaceRemoteNodeSkills({
+      nodeId: "node-1",
+      skills: [
+        {
+          name: "shared",
+          description: "Shared procedure",
+          content,
+          ...(revision ? { revision } : {}),
+        },
+      ],
+    });
+    const eligibility = { nodeSkills: { canExec: true, node: "node-1" } };
+    const snapshot = await buildSkillSnapshot(workspace, {
+      entries: loadWorkspaceSkills(workspace, { workspaceOnly: true, eligibility }),
+      eligibility,
+    });
+
+    expect(snapshot.resolvedSkills?.map((skill) => skill.name)).toEqual([
+      "node-1-shared",
+      "shared",
+    ]);
+    expect(snapshot.resolvedSkills?.find((skill) => skill.name === "shared")?.filePath).toBe(
+      path.join(workspace, "skills", "shared", "SKILL.md"),
+    );
+    expect((await prepareSkillResourceDelivery(snapshot, () => {}))?.skills).toMatchObject([
+      { name: "shared" },
+    ]);
+  });
+
+  it("does not reuse an exact copy advertised by a different node", async () => {
+    const workspace = await fs.realpath(temps.make("skill-node-owner-"));
+    const content = "---\nname: shared\ndescription: Shared procedure\n---\n# Shared\n";
+    await writeSkill(workspace, "shared", content);
+    const revision = (await prepareSkillResourceDelivery(await loadSnapshot(workspace), () => {}))!
+      .skills[0]!.revision;
+    for (const [nodeId, advertisedRevision] of [
+      ["node-1", "0".repeat(64)],
+      ["node-2", revision],
+    ] as const) {
+      recordRemoteSkillNodeInfo({ nodeId, connId: `conn-${nodeId}`, commands: ["system.run"] });
+      replaceRemoteNodeSkills({
+        nodeId,
+        skills: [
+          {
+            name: "shared",
+            description: "Shared procedure",
+            content,
+            revision: advertisedRevision,
+          },
+        ],
+      });
+    }
+    const eligibility = { nodeSkills: { canExec: true, node: "node-1" } };
+    const snapshot = await buildSkillSnapshot(workspace, {
+      entries: loadWorkspaceSkills(workspace, { workspaceOnly: true, eligibility }),
+      eligibility,
+    });
+
+    expect(snapshot.resolvedSkills?.map((skill) => skill.name)).toEqual([
+      "node-1-shared",
+      "shared",
+    ]);
+    expect(snapshot.resolvedSkills?.some((skill) => skill.filePath.includes("node-2"))).toBe(false);
+  });
+
+  it("preserves multi-node collision names when the session is unbound", async () => {
+    const workspace = await fs.realpath(temps.make("skill-node-unbound-"));
+    const content = "---\nname: shared\ndescription: Shared procedure\n---\n# Shared\n";
+    await writeSkill(workspace, "shared", content);
+    const revision = (await prepareSkillResourceDelivery(await loadSnapshot(workspace), () => {}))!
+      .skills[0]!.revision;
+    for (const nodeId of ["node-1", "node-2"]) {
+      recordRemoteSkillNodeInfo({ nodeId, connId: `conn-${nodeId}`, commands: ["system.run"] });
+      replaceRemoteNodeSkills({
+        nodeId,
+        skills: [{ name: "shared", description: "Shared procedure", content, revision }],
+      });
+    }
+    const eligibility = { nodeSkills: { canExec: true } };
+    const snapshot = await buildSkillSnapshot(workspace, {
+      entries: loadWorkspaceSkills(workspace, { workspaceOnly: true, eligibility }),
+      eligibility,
+    });
+
+    expect(snapshot.resolvedSkills?.map((skill) => skill.name)).toEqual([
+      "node-1-shared",
+      "node-2-shared",
+      "shared",
+    ]);
+    expect((await prepareSkillResourceDelivery(snapshot, () => {}))?.skills).toMatchObject([
+      { name: "shared" },
+    ]);
+  });
+
+  it("falls back after a support-only Gateway change invalidates a verified match", async () => {
+    const workspace = await fs.realpath(temps.make("skill-node-support-change-"));
+    const content = "---\nname: shared\ndescription: Shared procedure\n---\n# Shared\n";
+    const directory = await writeSkill(workspace, "shared", content);
+    const supportPath = path.join(directory, "support.txt");
+    await fs.writeFile(supportPath, "before");
+    const revision = (await prepareSkillResourceDelivery(await loadSnapshot(workspace), () => {}))!
+      .skills[0]!.revision;
+    recordRemoteSkillNodeInfo({
+      nodeId: "node-1",
+      connId: "conn-1",
+      commands: ["system.run"],
+    });
+    replaceRemoteNodeSkills({
+      nodeId: "node-1",
+      skills: [{ name: "shared", description: "Shared procedure", content, revision }],
+    });
+    const eligibility = { nodeSkills: { canExec: true, node: "node-1" } };
+    const initial = await resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir: workspace,
+      config: {},
+      eligibility,
+      watch: false,
+    });
+    expect(
+      initial.snapshot.resolvedSkills?.find((skill) => skill.name === "shared")?.filePath,
+    ).toBe("node://node-1/skills/shared/SKILL.md");
+    expect(initial.snapshot.resourceVersion).toBeTypeOf("number");
+
+    await fs.writeFile(supportPath, "after");
+    markSkillsSupportingFilesChanged({ workspaceDir: workspace });
+    const refreshed = await resolveReusableWorkspaceSkillSnapshot({
+      workspaceDir: workspace,
+      config: {},
+      eligibility,
+      existingSnapshot: initial.snapshot,
+      watch: false,
+    });
+
+    expect(refreshed.shouldRefresh).toBe(true);
+    expect(refreshed.snapshot.resourceVersion).toBeUndefined();
+    expect(refreshed.snapshot.resolvedSkills?.map((skill) => skill.name)).toEqual(
+      expect.arrayContaining(["node-1-shared", "shared"]),
+    );
+    expect(
+      (await prepareSkillResourceDelivery(refreshed.snapshot, () => {}))?.skills.some(
+        (skill) => skill.name === "shared",
+      ),
+    ).toBe(true);
+  });
+
   it.each(["AbortError", "TimeoutError"])(
     "preserves the exact frozen %s after partial materialization and failed cleanup",
     async (name) => {

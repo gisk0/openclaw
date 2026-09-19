@@ -9,7 +9,9 @@ import {
   NODE_SKILL_MAX_TOTAL_BYTES,
   NODE_SKILL_NAME_RE,
 } from "../shared/node-skill-constraints.js";
+import { prepareSkillBundle, readSkillBundleTree } from "../skills/library/bundle.js";
 import { loadSingleSkillDirectory } from "../skills/loading/local-loader.js";
+import { shouldSyncSkillPath } from "../skills/loading/skill-paths.js";
 import { tryRealpath } from "../skills/loading/symlink-targets.js";
 import { resolveConfigDir } from "../utils.js";
 
@@ -74,9 +76,9 @@ function listCandidateSkills(
   return candidates.toSorted((left, right) => left.name.localeCompare(right.name, "en"));
 }
 
-export function scanNodeHostedSkills(
+export async function scanNodeHostedSkills(
   options: ScanNodeHostedSkillsOptions = {},
-): NodeSkillDescriptor[] {
+): Promise<NodeSkillDescriptor[]> {
   const skillsDir = path.resolve(options.skillsDir ?? path.join(resolveConfigDir(), "skills"));
   const warn = options.warn ?? ((message: string) => console.warn(message));
   const rootSkillFile = path.join(skillsDir, "SKILL.md");
@@ -143,8 +145,27 @@ export function scanNodeHostedSkills(
       );
       continue;
     }
+    let revision: string;
+    try {
+      const bundle = prepareSkillBundle(
+        await readSkillBundleTree(skillDir, shouldSyncSkillPath, {
+          symlinks: "follow-within-root",
+        }),
+      );
+      const bundledContent = bundle.files
+        .find((file) => file.path === "SKILL.md")!
+        .bytes.toString("utf8");
+      if (bundledContent !== content) {
+        warn(`node host skill skipped (${skill.filePath}): changed while scanning`);
+        continue;
+      }
+      revision = bundle.revision;
+    } catch (error) {
+      warn(`node host skill skipped (${skill.filePath}): ${String(error)}`);
+      continue;
+    }
     totalBytes += contentBytes;
-    descriptors.push({ name: skill.name, description: skill.description, content });
+    descriptors.push({ name: skill.name, description: skill.description, content, revision });
   }
   return descriptors;
 }

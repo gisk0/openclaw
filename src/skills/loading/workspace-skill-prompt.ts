@@ -3,6 +3,9 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { resolveEffectiveAgentSkillsLimits } from "../discovery/agent-filter.js";
 import { filterPromptVisibleSkillEntries } from "../discovery/skill-index.js";
+import { getSkillsResourceVersion } from "../runtime/refresh-state.js";
+import { substituteMatchingBoundNodeSkills } from "../runtime/remote-skills.js";
+import { resolveSkillTreeRevision } from "../runtime/resources.js";
 import type { SkillEligibilityContext, SkillEntry, SkillSnapshot } from "../types.js";
 import { WORKSPACE_SKILLS_PROMPT_FORMAT_VERSION } from "../types.js";
 import { hasUnavailableSkillSecretOwners, isSkillSecretOwnerUnavailable } from "./config.js";
@@ -38,8 +41,40 @@ async function resolveWorkspaceSkillPromptState(
   prompt: string;
   resolvedSkills: Skill[];
   skillFilter?: string[];
+  resourceVersion?: number;
+  nodeSkillReferencePaths?: SkillSnapshot["nodeSkillReferencePaths"];
 }> {
-  const { eligible, skillFilter } = await resolveWorkspaceSkillPromptEntries(workspaceDir, opts);
+  const sourceScope = { executionWorkspaceDir: opts?.executionWorkspaceDir };
+  let eligible: SkillEntry[];
+  let skillFilter: string[] | undefined;
+  let resourceVersion: number | undefined;
+  let nodeSkillReferencePaths: SkillSnapshot["nodeSkillReferencePaths"];
+  for (;;) {
+    const preparedResourceVersion = getSkillsResourceVersion(workspaceDir, sourceScope);
+    const prepared = await resolveWorkspaceSkillPromptEntries(workspaceDir, opts);
+    const substitution = await substituteMatchingBoundNodeSkills(
+      prepared.eligible,
+      opts?.eligibility?.nodeSkills,
+      async (entry) => {
+        opts?.assertCurrent?.();
+        const revision = await resolveSkillTreeRevision(entry.skill, opts?.librarySelections);
+        opts?.assertCurrent?.();
+        return revision;
+      },
+    );
+    opts?.assertCurrent?.();
+    if (
+      substitution.referencePaths.length > 0 &&
+      getSkillsResourceVersion(workspaceDir, sourceScope) !== preparedResourceVersion
+    ) {
+      continue;
+    }
+    eligible = substitution.entries;
+    skillFilter = prepared.skillFilter;
+    nodeSkillReferencePaths = substitution.referencePaths;
+    resourceVersion = nodeSkillReferencePaths.length > 0 ? preparedResourceVersion : undefined;
+    break;
+  }
   const promptEntries = filterPromptVisibleSkillEntries(eligible);
   const remoteNote = opts?.eligibility?.remote?.note?.trim();
   const resolvedSkills = promptEntries.map((entry) => entry.skill);
@@ -61,6 +96,8 @@ async function resolveWorkspaceSkillPromptState(
     prompt: prepared.prompt,
     resolvedSkills: prepared.skills.map((skill) => byName.get(skill.name)!),
     skillFilter,
+    resourceVersion,
+    nodeSkillReferencePaths,
   };
 }
 
@@ -68,10 +105,14 @@ export async function buildSkillSnapshot(
   workspaceDir: string,
   opts?: WorkspaceSkillBuildOptions & { snapshotVersion?: number },
 ): Promise<SkillSnapshot> {
-  const { eligible, prompt, resolvedSkills, skillFilter } = await resolveWorkspaceSkillPromptState(
-    workspaceDir,
-    opts,
-  );
+  const {
+    eligible,
+    prompt,
+    resolvedSkills,
+    skillFilter,
+    resourceVersion,
+    nodeSkillReferencePaths,
+  } = await resolveWorkspaceSkillPromptState(workspaceDir, opts);
   return {
     prompt,
     skills: eligible.map((entry) => ({
@@ -85,6 +126,8 @@ export async function buildSkillSnapshot(
     ...(opts?.eligibility?.nodeSkills
       ? { nodeSkillsEligibility: opts.eligibility.nodeSkills }
       : {}),
+    ...(resourceVersion === undefined ? {} : { resourceVersion }),
+    ...(nodeSkillReferencePaths?.length ? { nodeSkillReferencePaths } : {}),
     resolvedSkills,
     version: opts?.snapshotVersion,
     promptFormatVersion: WORKSPACE_SKILLS_PROMPT_FORMAT_VERSION,

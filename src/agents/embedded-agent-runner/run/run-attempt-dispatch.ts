@@ -5,6 +5,7 @@ import { resolveSessionTranscriptRuntimeTarget } from "../../../config/sessions/
 import type { resolveContextEngine } from "../../../context-engine/registry.js";
 import { attachModelProviderRuntimePluginHandle } from "../../../plugins/provider-hook-runtime.js";
 import { getGatewayContextResolver } from "../../../plugins/runtime/gateway-request-scope.js";
+import { remapSkillReferencePaths } from "../../../skills/reference-paths.js";
 import { createAgentHarnessTaskRuntimeScope } from "../../../tasks/agent-harness-task-runtime-scope.js";
 import { createTrajectoryRuntimeRecorder } from "../../../trajectory/runtime.js";
 import { resolveAdmittedRunActiveAssertion } from "../../admitted-run-context.js";
@@ -24,7 +25,6 @@ import { resolveSessionSkillResourceSnapshot } from "../../session-placement-ski
 import { createToolTerminalObserver } from "../../tool-terminal-outcome.js";
 import { resolveAttemptWorkspaceSandbox } from "../../workspace-sandbox.js";
 import type { EmbeddedRunReplayState } from "../replay-state.js";
-import { remapSkillReferencePaths } from "../sandbox-skills.js";
 import { prepareEmbeddedSkills } from "../skill-runtime.js";
 import { mapThinkingLevelForProvider } from "../utils.js";
 import { prepareExecApprovalContinuationForAttempt } from "./attempt-exec-approval-continuation.js";
@@ -343,10 +343,16 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     storePath: params.sessionTarget?.storePath,
   });
   let skillsSnapshot = resolveSessionSkillResourceSnapshot(params.skillsSnapshot);
-  let skillReferencePaths = pluginSandbox?.readOnlyResourceMounts?.map((mount) => ({
+  const mountedSkillReferencePaths = pluginSandbox?.readOnlyResourceMounts?.map((mount) => ({
     skillFile: path.join(mount.hostPath, "SKILL.md"),
     readPath: path.posix.join(mount.containerPath, "SKILL.md"),
   }));
+  const initialSkillReferencePaths = [
+    ...(mountedSkillReferencePaths ?? []),
+    ...(skillsSnapshot?.nodeSkillReferencePaths ?? []),
+  ];
+  let skillReferencePaths =
+    initialSkillReferencePaths.length > 0 ? initialSkillReferencePaths : undefined;
   if (pluginSandbox?.enabled && !pluginSandbox.readOnlyResourceMounts?.length && skillsSnapshot) {
     const assertActiveRun = resolveAdmittedRunActiveAssertion(
       admittedRunContext,

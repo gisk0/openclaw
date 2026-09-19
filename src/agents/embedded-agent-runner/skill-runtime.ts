@@ -62,6 +62,10 @@ export async function prepareEmbeddedSkills(params: {
     skillsAnchorWorkspace: params.attempt.bootstrapWorkspaceDir ?? params.effectiveWorkspace,
     skillsSnapshot: params.attempt.skillsSnapshot,
   });
+  const runtimeSkillUsagePaths = [
+    ...(skillUsagePaths ?? []),
+    ...(skillsSnapshot?.nodeSkillReferencePaths ?? []),
+  ];
   const { shouldLoadSkillEntries, skillEntries, loadSkillEntries, preserveEntryOrder } =
     await resolveEmbeddedRunSkillEntries({
       assertCurrent: params.assertCurrent,
@@ -146,7 +150,7 @@ export async function prepareEmbeddedSkills(params: {
     return {
       restoreSkillEnv,
       skillReadResources,
-      skillUsagePaths,
+      skillUsagePaths: runtimeSkillUsagePaths.length > 0 ? runtimeSkillUsagePaths : undefined,
       skillsPrompt,
       skillsSnapshotForRun: skillsSnapshot,
       codeModeSkills,

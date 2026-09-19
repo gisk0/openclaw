@@ -345,7 +345,10 @@ export function startNodeHostConnection({
       return;
     }
     if (inventory.skills) {
-      queueOptionalPublication(NODE_SKILLS_UPDATE_METHOD, { skills: inventory.skills }, "skill");
+      const skills = gatewayCapabilities.has(GATEWAY_SERVER_CAPS.NODE_SKILL_REVISIONS)
+        ? inventory.skills
+        : inventory.skills.map(({ revision: _revision, ...skill }) => skill);
+      queueOptionalPublication(NODE_SKILLS_UPDATE_METHOD, { skills }, "skill");
     }
     queueOptionalPublication(
       NODE_PLUGIN_TOOLS_UPDATE_METHOD,

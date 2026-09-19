@@ -24,6 +24,7 @@ import { loadSingleSkillDirectory } from "../loading/local-loader.js";
 import { createSyntheticSourceInfo } from "../loading/skill-contract.js";
 import { shouldSyncSkillPath } from "../loading/skill-paths.js";
 import { formatSkillsForPromptBounded } from "../loading/skill-prompt-limits.js";
+import { remapSkillReferencePaths } from "../reference-paths.js";
 import type { ExplicitSkillSelection, SkillSnapshot } from "../types.js";
 import { resolveSkillResourceCandidates } from "./resource-candidates.js";
 
@@ -48,6 +49,19 @@ function isMissingDiscoveredSkillRoot(error: unknown): error is SkillTreeDirecto
   );
 }
 
+export async function resolveSkillTreeRevision(
+  skill: NonNullable<SkillSnapshot["resolvedSkills"]>[number],
+  librarySelections: SkillSnapshot["librarySelections"] = [],
+): Promise<string> {
+  const pin = librarySelections.find((selection) => selection.name === skill.name);
+  const files = pin
+    ? await readSelectedSkillLibraryFiles(pin)
+    : await readSkillBundleTree(skill.baseDir, shouldSyncSkillPath, {
+        symlinks: "follow-within-root",
+      });
+  return prepareSkillBundle(files).revision;
+}
+
 // The caller retains these bytes for its turn. Catalog versions do not version supporting files.
 export async function prepareSkillResourceDelivery(
   snapshot: SkillSnapshot | undefined,
@@ -57,18 +71,22 @@ export async function prepareSkillResourceDelivery(
   if (!snapshot) {
     return undefined;
   }
+  const runtimeSelections = explicitSelections.map((selection) => ({
+    ...selection,
+    path: remapSkillReferencePaths(selection.path, snapshot.nodeSkillReferencePaths),
+  }));
   assertCurrent();
   if (
     !snapshot.resolvedSkills?.length &&
     !snapshot.librarySelections?.length &&
-    !explicitSelections.length
+    !runtimeSelections.length
   ) {
     return undefined;
   }
   const skills: SkillResourceDelivery["skills"] = [];
   let total = 0;
   const candidates = resolveSkillResourceCandidates(snapshot)!;
-  for (const selected of explicitSelections) {
+  for (const selected of runtimeSelections) {
     if (
       selected.path.startsWith("node://") ||
       candidates.some((skill) => skill.filePath === selected.path)
@@ -110,7 +128,7 @@ export async function prepareSkillResourceDelivery(
       continue;
     }
     const pin = snapshot.librarySelections?.find((selection) => selection.name === skill.name);
-    const explicitlySelected = explicitSelections.some(
+    const explicitlySelected = runtimeSelections.some(
       (selection) => selection.path === skill.filePath,
     );
     let files: Awaited<ReturnType<typeof readSkillBundleTree>>;
@@ -154,7 +172,7 @@ export async function prepareSkillResourceDelivery(
       modelVisible:
         (snapshot.resolvedSkills?.some((selected) => selected.filePath === skill.filePath) ??
           false) ||
-        explicitSelections.some((selected) => selected.path === skill.filePath),
+        runtimeSelections.some((selected) => selected.path === skill.filePath),
       ...(skill.displayName ? { displayName: skill.displayName } : {}),
       description: skill.description,
       revision: bundle.revision,

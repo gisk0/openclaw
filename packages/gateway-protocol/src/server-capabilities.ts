@@ -4,6 +4,7 @@ export const GATEWAY_SERVER_CAPS = {
   CHAT_SEND_ROUTING_CONTRACT: "chat-send-routing-contract",
   GATEWAY_RESTART_TARGET_SAFE: "gateway-restart-target-safe-v1",
   MODEL_CATALOG_SNAPSHOT: "model-catalog-snapshot",
+  NODE_SKILL_REVISIONS: "node-skill-revisions-v1",
   NODE_WORKER_BUNDLE_RETENTION: "node-worker-bundle-retention-v1",
   NODE_WORKER_BUNDLE_STATUS: "node-worker-bundle-status-v1",
   NODE_WORKER_CAPTURED_EXEC_POLICY: "node-worker-captured-exec-policy",

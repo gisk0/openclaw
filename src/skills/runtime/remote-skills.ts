@@ -3,8 +3,10 @@ import { createSyntheticSourceInfo } from "../../agents/sessions/source-info.js"
 import { sha256Hex } from "../../infra/crypto-digest.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveNodeIdFromNodeList } from "../../shared/node-resolve.js";
+import { NODE_SKILL_REVISION_RE } from "../../shared/node-skill-constraints.js";
 import { parseSkillFrontmatter, resolveSkillInvocationPolicy } from "../loading/frontmatter.js";
-import type { ParsedSkillFrontmatter, SkillEntry } from "../types.js";
+import { resolveSkillTelemetrySource } from "../loading/source.js";
+import type { ParsedSkillFrontmatter, SkillEntry, SkillUsagePath } from "../types.js";
 import { areOrderedArraysEqual } from "./ordered-array-equality.js";
 import { bumpSkillsSnapshotVersion } from "./refresh-state.js";
 
@@ -52,7 +54,13 @@ function prepareNodeSkills(
         log.warn(`dropped node skill with mismatched frontmatter: ${nodeId}/${skill.name}`);
         continue;
       }
-      prepared.push({ ...skill, frontmatter, contentHash: sha256Hex(skill.content) });
+      const { revision, ...descriptor } = skill;
+      prepared.push({
+        ...descriptor,
+        ...(revision && NODE_SKILL_REVISION_RE.test(revision) ? { revision } : {}),
+        frontmatter,
+        contentHash: sha256Hex(skill.content),
+      });
     } catch (error) {
       const filePath = `node://${encodeURIComponent(nodeId)}/skills/${skill.name}/SKILL.md`;
       log.warn(`dropped node skill with invalid frontmatter (${filePath}): ${String(error)}`);
@@ -104,7 +112,8 @@ export function replaceRemoteNodeSkills(params: {
       (previous, next) =>
         previous.name === next.name &&
         previous.description === next.description &&
-        previous.content === next.content,
+        previous.content === next.content &&
+        previous.revision === next.revision,
     );
   remoteSkillNodes.set(params.nodeId, {
     nodeId: params.nodeId,
@@ -167,15 +176,9 @@ function locatorNote(node: RemoteSkillNode, skillName: string): string {
   return `Node-hosted on ${label} (${node.nodeId}). Read this SKILL.md with the normal read tool at its exact node:// location; do not use file_fetch, which only accepts approved absolute node paths. If read is unavailable, use exec host=node node=${node.nodeId} with workdir=${cwd} to run cat SKILL.md. Run referenced files and bins with the same exec target and workdir; the node host resolves that locator to the node-local skill directory.`;
 }
 
-export function mergeRemoteNodeSkillEntries(
-  localEntries: readonly SkillEntry[],
-  options?: { canExec?: boolean; node?: string },
-): SkillEntry[] {
-  if (options?.canExec !== true) {
-    return [...localEntries];
-  }
+function connectedRemoteSkillNodes(): RemoteSkillNode[] {
   const currentConnections = reconcileRemoteSkillConnections?.();
-  const connectedNodes = [...remoteSkillNodes.values()].filter(
+  return [...remoteSkillNodes.values()].filter(
     (node) =>
       node.connected &&
       node.canExec &&
@@ -183,6 +186,115 @@ export function mergeRemoteNodeSkillEntries(
         (node.connId !== undefined &&
           currentConnections.has(remoteConnectionKey(node.nodeId, node.connId)))),
   );
+}
+
+function createRemoteSkillEntry(
+  node: RemoteSkillNode,
+  skill: PreparedNodeSkill,
+  exposedName: string,
+): SkillEntry {
+  const filePath = remoteSkillLocation(node.nodeId, skill.name);
+  const invocation = resolveSkillInvocationPolicy(skill.frontmatter);
+  return {
+    skill: {
+      name: exposedName,
+      description: skill.description,
+      locationNote: locatorNote(node, skill.name),
+      readContent: skill.content,
+      contentHash: skill.contentHash,
+      filePath,
+      baseDir: filePath.slice(0, -"/SKILL.md".length),
+      source: "openclaw-node",
+      sourceInfo: createSyntheticSourceInfo(filePath, {
+        source: "openclaw-node",
+        scope: "temporary",
+        origin: "top-level",
+        baseDir: filePath.slice(0, -"/SKILL.md".length),
+      }),
+      disableModelInvocation: invocation.disableModelInvocation,
+    },
+    frontmatter: skill.frontmatter,
+    // Connected node execution is the eligibility boundary for node-owned context.
+    invocation,
+    disableCommandDispatch: true,
+    exposure: {
+      includeInRuntimeRegistry: true,
+      includeInAvailableSkillsPrompt: !invocation.disableModelInvocation,
+      userInvocable: invocation.userInvocable,
+    },
+  };
+}
+
+export async function substituteMatchingBoundNodeSkills(
+  entries: readonly SkillEntry[],
+  options: { canExec?: boolean; node?: string } | undefined,
+  resolveRevision: (entry: SkillEntry) => Promise<string>,
+): Promise<{ entries: SkillEntry[]; referencePaths: SkillUsagePath[] }> {
+  if (options?.canExec !== true || !options.node) {
+    return { entries: [...entries], referencePaths: [] };
+  }
+  const connectedNodes = connectedRemoteSkillNodes();
+  let boundNodeId: string;
+  try {
+    boundNodeId = resolveNodeIdFromNodeList(connectedNodes, options.node);
+  } catch {
+    return { entries: [...entries], referencePaths: [] };
+  }
+  const node = connectedNodes.find((candidate) => candidate.nodeId === boundNodeId);
+  if (!node) {
+    return { entries: [...entries], referencePaths: [] };
+  }
+
+  const referencePaths: SkillUsagePath[] = [];
+  let resolved = [...entries];
+  for (const skill of node.skills) {
+    if (!skill.revision) {
+      continue;
+    }
+    const localEntry = resolved.find(
+      (entry) => entry.skill.name === skill.name && !entry.skill.filePath.startsWith("node://"),
+    );
+    if (!localEntry) {
+      continue;
+    }
+    let localRevision: string;
+    try {
+      localRevision = await resolveRevision(localEntry);
+    } catch {
+      continue;
+    }
+    if (localRevision !== skill.revision) {
+      continue;
+    }
+    const remotePath = remoteSkillLocation(node.nodeId, skill.name);
+    resolved = resolved.filter(
+      (entry) => entry === localEntry || entry.skill.filePath !== remotePath,
+    );
+    referencePaths.push({
+      skillFile: localEntry.skill.filePath,
+      readPath: remotePath,
+      skillName: localEntry.skill.name,
+      skillSource: resolveSkillTelemetrySource(localEntry.skill),
+    });
+    const remoteEntry = createRemoteSkillEntry(node, skill, skill.name);
+    resolved[resolved.indexOf(localEntry)] = {
+      ...localEntry,
+      skill: remoteEntry.skill,
+      disableCommandDispatch: true,
+    };
+  }
+  return { entries: resolved, referencePaths };
+}
+
+export function mergeRemoteNodeSkillEntries(
+  localEntries: readonly SkillEntry[],
+  options?: { canExec?: boolean; node?: string },
+  reservedLocalNames: readonly string[] = [],
+): SkillEntry[] {
+  if (options?.canExec !== true) {
+    return [...localEntries];
+  }
+  const connectedNodes = connectedRemoteSkillNodes();
   let boundNodeId: string | undefined;
   if (options.node) {
     try {
@@ -207,7 +319,10 @@ export function mergeRemoteNodeSkillEntries(
   for (const { skill } of remote) {
     remoteNameCounts.set(skill.name, (remoteNameCounts.get(skill.name) ?? 0) + 1);
   }
-  const localNames = new Set(localEntries.map((entry) => entry.skill.name));
+  const localNames = new Set([
+    ...localEntries.map((entry) => entry.skill.name),
+    ...reservedLocalNames,
+  ]);
   const usedNames = new Set(localNames);
   const remoteEntries: SkillEntry[] = [];
   for (const { node, skill } of remote) {
@@ -220,37 +335,7 @@ export function mergeRemoteNodeSkillEntries(
       continue;
     }
     usedNames.add(exposedName);
-    const filePath = remoteSkillLocation(node.nodeId, skill.name);
-    const invocation = resolveSkillInvocationPolicy(skill.frontmatter);
-    remoteEntries.push({
-      skill: {
-        name: exposedName,
-        description: skill.description,
-        locationNote: locatorNote(node, skill.name),
-        readContent: skill.content,
-        contentHash: skill.contentHash,
-        filePath,
-        baseDir: filePath.slice(0, -"/SKILL.md".length),
-        source: "openclaw-node",
-        sourceInfo: createSyntheticSourceInfo(filePath, {
-          source: "openclaw-node",
-          scope: "temporary",
-          origin: "top-level",
-          baseDir: filePath.slice(0, -"/SKILL.md".length),
-        }),
-        disableModelInvocation: invocation.disableModelInvocation,
-      },
-      frontmatter: skill.frontmatter,
-      // Node-hosted v1 uses connected node execution as its eligibility boundary.
-      // Gateway-local OS, bin, env, and config probes do not apply to node-owned context.
-      invocation,
-      disableCommandDispatch: true,
-      exposure: {
-        includeInRuntimeRegistry: true,
-        includeInAvailableSkillsPrompt: !invocation.disableModelInvocation,
-        userInvocable: invocation.userInvocable,
-      },
-    });
+    remoteEntries.push(createRemoteSkillEntry(node, skill, exposedName));
   }
   return [...localEntries, ...remoteEntries].toSorted((left, right) =>
     left.skill.name.localeCompare(right.skill.name, "en"),

@@ -1,5 +1,6 @@
 // Skill types expose the shared skill contracts used by discovery, loading, and runtime flows.
 import type { Skill } from "./loading/skill-contract.js";
+import type { SkillReferencePath } from "./reference-paths.js";
 
 export type SkillInstallSpec = {
   id?: string;
@@ -52,11 +53,7 @@ type SkillCommandDispatchSpec = {
 
 export type SkillTelemetrySource = "bundled" | "unknown" | "workspace";
 
-export type SkillUsagePath = {
-  /** Path visible to the tool runtime when it reads SKILL.md. */
-  readPath: string;
-  /** Canonical source SKILL.md path used as the lifecycle identity. */
-  skillFile: string;
+export type SkillUsagePath = SkillReferencePath & {
   skillName: string;
   skillSource: SkillTelemetrySource;
 };
@@ -144,6 +141,10 @@ export type SkillSnapshot = {
   skillOverrides?: Record<string, boolean>;
   /** Effective node-exec eligibility used to select connected node-hosted skills. */
   nodeSkillsEligibility?: SkillEligibilityContext["nodeSkills"];
+  /** Resource generation that verified a Gateway tree reused from a bound node. */
+  resourceVersion?: number;
+  /** Verified Gateway source paths replaced by exact bound-node locators. */
+  nodeSkillReferencePaths?: SkillUsagePath[];
   resolvedSkills?: Skill[];
   /** Present only when a session merges skills from distinct agent and execution roots. */
   skillRoots?: {

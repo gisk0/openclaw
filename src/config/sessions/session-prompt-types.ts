@@ -17,6 +17,15 @@ export type SessionSkillSnapshot = {
   skillFilter?: string[];
   /** Effective node-exec eligibility used to select connected node-hosted skills. */
   nodeSkillsEligibility?: { canExec: boolean; node?: string };
+  /** Resource generation that verified a Gateway tree reused from a bound node. */
+  resourceVersion?: number;
+  /** Verified Gateway source paths replaced by exact bound-node locators. */
+  nodeSkillReferencePaths?: Array<{
+    skillFile: string;
+    readPath: string;
+    skillName: string;
+    skillSource: "bundled" | "unknown" | "workspace";
+  }>;
   /**
    * Runtime-only, never persisted. Carries the full parsed Skill[] (including
    * each SKILL.md body) so the embedded runner can skip a workspace skill

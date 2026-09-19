@@ -6,6 +6,7 @@ import {
   NODE_SKILL_MAX_DESCRIPTION_LENGTH,
   NODE_SKILL_MAX_TOTAL_BYTES,
   NODE_SKILL_NAME_RE,
+  NODE_SKILL_REVISION_RE,
 } from "../shared/node-skill-constraints.js";
 
 const log = createSubsystemLogger("gateway/node-skills");
@@ -42,7 +43,14 @@ export function normalizeNodeSkillDescriptors(params: {
     }
     seen.add(name);
     totalBytes += contentBytes;
-    normalized.push({ name, description, content: skill.content });
+    normalized.push({
+      name,
+      description,
+      content: skill.content,
+      ...(skill.revision && NODE_SKILL_REVISION_RE.test(skill.revision)
+        ? { revision: skill.revision }
+        : {}),
+    });
   }
 
   if (droppedCount > 0) {

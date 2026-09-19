@@ -9807,15 +9807,18 @@ public struct NodeSkillDescriptor: Codable, Sendable {
     public let name: String
     public let description: String
     public let content: String
+    public let revision: String?
 
     public init(
         name: String,
         description: String,
-        content: String)
+        content: String,
+        revision: String? = nil)
     {
         self.name = name
         self.description = description
         self.content = content
+        self.revision = revision
     }
 }
 

@@ -53,6 +53,7 @@ import {
 import { annotateInterSessionPromptText } from "../../sessions/input-provenance.js";
 import { captureAsyncWorkTracker } from "../../shared/async-work-scope.js";
 import { resolveSkillsPrompt } from "../../skills/loading/workspace-skill-prompt.js";
+import { hasSkillRefs, remapPreparedSkillRefs } from "../../skills/reference-paths.js";
 import { resolveEmbeddedRunSkillEntries } from "../../skills/runtime/embedded-run-entries.js";
 import { resolveReusableWorkspaceSkillSnapshot } from "../../skills/runtime/session-snapshot.js";
 import type { SkillUsagePath } from "../../skills/types.js";
@@ -117,7 +118,6 @@ import {
 } from "../embedded-agent-runner/run/runtime-context-prompt.js";
 import {
   mapSandboxSkillEntriesForPrompt,
-  remapSkillReferencePaths,
   resolveSandboxSkillRuntimeInputs,
 } from "../embedded-agent-runner/sandbox-skills.js";
 import { selectContextEngineForTranscriptHost } from "../harness/context-engine-logical-turn.js";
@@ -2093,8 +2093,8 @@ async function prepareCliRunContextWithinReadFence(
           prompt: params.prompt,
           messageToolAvailable,
         }) ?? params.prompt);
-    if (!isControlOperation && params.skillsSnapshot?.librarySelections?.length) {
-      preparedPrompt = remapSkillReferencePaths(preparedPrompt, preparedSkills.usagePaths);
+    if (!isControlOperation && hasSkillRefs(params.skillsSnapshot, true)) {
+      preparedPrompt = remapPreparedSkillRefs(preparedPrompt, preparedSkills, params);
     }
     if (!skipsTurnPreparation) {
       try {
