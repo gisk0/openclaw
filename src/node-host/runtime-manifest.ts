@@ -1,5 +1,8 @@
 /** The node-local command surface owns both advertised commands and their capabilities. */
-import type { NodePluginToolDescriptor } from "../../packages/gateway-protocol/src/schema/nodes.js";
+import type {
+  NodePluginToolDescriptor,
+  NodeSkillDescriptor,
+} from "../../packages/gateway-protocol/src/schema/nodes.js";
 import { NODE_CLAUDE_SKILLS_CAPABILITY } from "../infra/node-claude-skill-protocol.js";
 import {
   NODE_AGENT_CLI_CLAUDE_RUN_COMMAND,
@@ -87,12 +90,12 @@ export function buildNodeHostManifest(params: {
 }
 
 export type NodeHostInventory = {
-  skills: unknown[] | null;
+  skills: NodeSkillDescriptor[] | null;
   pluginTools: NodePluginToolDescriptor[];
 };
 
 export function createNodeHostInventory(
-  skills: unknown[] | null,
+  skills: NodeSkillDescriptor[] | null,
   pluginTools: readonly NodePluginToolDescriptor[],
   mcpDescriptors: readonly NodePluginToolDescriptor[] = [],
 ): NodeHostInventory {
