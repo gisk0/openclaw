@@ -373,6 +373,7 @@ test.each([
               return true;
             });
         }
+        throw new Error(`Unsupported metadata mutation: ${kind}`);
       })();
       try {
         await Promise.race([queued.promise, mutation]);
