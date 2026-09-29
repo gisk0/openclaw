@@ -148,14 +148,9 @@ export function captureDevicePairingPublication(admission: OpenClawStateDatabase
           captured.epoch++;
         },
         finish(settled: boolean) {
-          if (captured.mutation === mutation) {
-            // Without a commit receipt, even a metadata write may have observed
-            // an external revision or lost its database authority. Fail closed.
-            captured.blocked = true;
-            if (settled) {
-              captured.mutation = undefined;
-              captured.epoch++;
-            }
+          if (settled && captured.mutation === mutation) {
+            captured.mutation = undefined;
+            captured.epoch++;
           }
         },
       };

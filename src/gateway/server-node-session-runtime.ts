@@ -36,7 +36,6 @@ export function createGatewayNodeSessionRuntime(params: {
   getConfig?: NodeRegistryOptions["getConfig"];
   onRunnerStateChanged?: (nodeId: string, change: NodeRunnerStateChange) => void;
   resolveCurrentPairingState?: NodeRegistryOptions["resolveCurrentPairingState"];
-  withCurrentPairingState?: NodeRegistryOptions["withCurrentPairingState"];
   isPairingStateCurrent?: NodeRegistryOptions["isPairingStateCurrent"];
   onPairingInvalidated?: NodeRegistryOptions["onPairingInvalidated"];
   onPairingGenerationChanged?: NodeRegistryOptions["onPairingGenerationChanged"];
@@ -51,9 +50,9 @@ export function createGatewayNodeSessionRuntime(params: {
         getConfig: params.getConfig,
         resolveCurrentPairingState:
           params.resolveCurrentPairingState ?? resolveCurrentPairedDeviceNodeBinding,
-        withCurrentPairingState:
-          params.withCurrentPairingState ??
-          (params.resolveCurrentPairingState ? undefined : withCurrentPairedDeviceNodeBinding),
+        withCurrentPairingState: params.resolveCurrentPairingState
+          ? undefined
+          : withCurrentPairedDeviceNodeBinding,
         isPairingStateCurrent: params.isPairingStateCurrent ?? isPairedDeviceNodeBindingCurrent,
         onPairingInvalidated: params.onPairingInvalidated,
         onDesktopAvailabilityChanged: (nodeId) => {

@@ -36,6 +36,7 @@ import type { PluginRuntimeGatewayRequestScope } from "../plugins/runtime/gatewa
 import { getPluginRuntimeLoadContext } from "../plugins/runtime/load-context.js";
 import type { PluginRuntime } from "../plugins/runtime/types.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { withEnv } from "../test-utils/env.js";
 import { createInternalAgentTurnFacade } from "./agent-turn/internal-facade.js";
 import type { GatewayRequestContext, GatewayRequestOptions } from "./server-methods/types.js";
@@ -1993,11 +1994,21 @@ describe("loadGatewayPlugins", () => {
     },
   );
 
-  test("cancels a retained duplex invocation when its delegated caller authority closes", async () => {
+  test("rechecks delegated caller authority after a duplex send waits for pairing", async () => {
     const registry = createDuplexPluginRegistry();
     loadOpenClawPlugins.mockReturnValue(registry);
     loadStartupPluginFixture();
-    const sendInvokeInputWhenCurrent = vi.fn();
+    const waiting = createDeferredCore();
+    const release = createDeferredCore();
+    const delivered = vi.fn();
+    const sendInvokeInputWhenCurrent = vi.fn(
+      async (_invokeId: string, payload: unknown, assertCurrent?: () => void) => {
+        waiting.resolve();
+        await release.promise;
+        assertCurrent?.();
+        delivered(payload);
+      },
+    );
     const validateAgentRuntimeApprovalAuthority = vi.fn(() => true);
     const context = {
       nodeRegistry: { sendInvokeInputWhenCurrent },
@@ -2049,11 +2060,17 @@ describe("loadGatewayPlugins", () => {
         ),
     );
 
-    validateAgentRuntimeApprovalAuthority.mockReturnValue(false);
-
-    await expect(channel.send(Uint8Array.of(1))).rejects.toThrow(/authority.*no longer current/i);
+    const sending = channel.send(Uint8Array.of(1));
+    const rejectedSend = expect(sending).rejects.toThrow(/authority.*no longer current/i);
+    try {
+      await waiting.promise;
+      validateAgentRuntimeApprovalAuthority.mockReturnValue(false);
+    } finally {
+      release.resolve();
+    }
+    await rejectedSend;
     expect(invokeSignal?.aborted).toBe(true);
-    expect(sendInvokeInputWhenCurrent).not.toHaveBeenCalled();
+    expect(delivered).not.toHaveBeenCalled();
     await expect(channel.closed).rejects.toThrow(/authority.*no longer current/i);
     expect(() => channel.onMessage(vi.fn())).toThrow(/authority.*no longer current/i);
   });

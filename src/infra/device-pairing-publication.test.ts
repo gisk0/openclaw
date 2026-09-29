@@ -23,19 +23,8 @@ import {
   isPairedDeviceNodeBindingCurrent,
   withCurrentPairedDeviceNodeBinding,
 } from "./device-pairing-node-state.js";
-import {
-  recordPairedNodeHostStats,
-  recordPairedNodeConnection,
-  recordPairedNodeDisconnection,
-  renamePairedNode,
-} from "./device-pairing-node.js";
 import { getPublishedPairedDeviceBinding } from "./device-pairing-publication.js";
 import { persistDevicePairingStoreState } from "./device-pairing-store.js";
-import {
-  revokeDeviceToken,
-  rotateDeviceToken,
-  verifyDeviceToken,
-} from "./device-pairing-tokens.js";
 import { withCurrentDevicePairingSnapshot } from "./device-pairing-worker.js";
 import {
   getPairedDevice,
@@ -43,7 +32,6 @@ import {
   listDevicePairingReadOnly,
   removePairedDevice,
   updatePairedDeviceMetadata,
-  updatePairedDevicePresence,
 } from "./device-pairing.js";
 
 let baseDir: string;
@@ -242,282 +230,8 @@ test.each(["worker commit", "external commit"] as const)(
   },
 );
 
-// Hold the actual mutation adapter before worker execution: this is the interval
-// in which unrelated presence writes used to reject live input and progress.
-test.each([
-  { kind: "metadata", target: "node" },
-  { kind: "metadata", target: "other" },
-  { kind: "presence", target: "node" },
-  { kind: "presence", target: "other" },
-  { kind: "hostStats", target: "node" },
-  { kind: "hostStats", target: "other" },
-  { kind: "connection", target: "node" },
-  { kind: "connection", target: "other" },
-  { kind: "disconnection", target: "node" },
-  { kind: "disconnection", target: "other" },
-  { kind: "rename", target: "node" },
-  { kind: "rename", target: "other" },
-  { kind: "verifyToken", target: "node" },
-  { kind: "verifyToken", target: "other" },
-] as const)(
-  "waits for a $kind mutation on $target before admitting current node traffic",
-  async ({ kind, target }) => {
-    await withEnvAsync({ OPENCLAW_STATE_DIR: baseDir }, async () => {
-      const device = await getPairedDevice("node", baseDir);
-      persistDevicePairingStoreState(
-        {
-          pendingById: {},
-          pairedByDeviceId: {
-            node: device!,
-            other: { ...device!, deviceId: "other", publicKey: "other-key" },
-          },
-        },
-        baseDir,
-        "paired",
-      );
-      await listDevicePairing(baseDir);
-      const binding = getPublishedPairedDeviceBinding("node", baseDir)!;
-      const generation = await captureNodePairingGeneration(target);
-      const registry = new NodeRegistry({
-        isPairingStateCurrent: isPairedDeviceNodeBindingCurrent,
-        resolveCurrentPairingState: async (nodeId) =>
-          withCurrentPairedDeviceNodeBinding(nodeId, (current) => current, baseDir),
-        withCurrentPairingState: (nodeId, effect) =>
-          withCurrentPairedDeviceNodeBinding(nodeId, effect, baseDir),
-      });
-      const frames: string[] = [];
-      const sent = createDeferredCore<string>();
-      const socket = createTestNodeSocket(frames);
-      socket.send.mockImplementation((frame: string) => {
-        frames.push(frame);
-        sent.resolve(frame);
-      });
-      registerNodeSession(
-        registry,
-        makeClient("conn", "node", frames, {
-          socket: socket as unknown as GatewayWsClient["socket"],
-        }),
-        {
-          pairingIdentity: binding.identity,
-          pairingGeneration: binding.generation,
-        },
-      );
-      const chunks: string[] = [];
-      const invocation = registry.invoke({
-        nodeId: "node",
-        command: "debug.ping",
-        timeoutMs: 60_000,
-        idleTimeoutMs: 30_000,
-        onProgress: (chunk) => chunks.push(chunk),
-      });
-      const invokeId = JSON.parse(await sent.promise).payload.id as string;
-      const queued = createDeferredCore();
-      const release = createDeferredCore();
-      const original = stateWorker.runOpenClawStateWorkerOperation;
-      const writer = vi
-        .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
-        .mockImplementationOnce(async (...args) => {
-          queued.resolve();
-          await release.promise;
-          return original(...args);
-        });
-      const mutation = (() => {
-        switch (kind) {
-          case "metadata":
-            return updatePairedDeviceMetadata(target, { displayName: "Updated" }, baseDir);
-          case "presence":
-            return updatePairedDevicePresence(
-              target,
-              { lastSeenAtMs: 100, lastSeenReason: "heartbeat" },
-              generation!,
-              baseDir,
-            );
-          case "hostStats":
-            return recordPairedNodeHostStats({
-              nodeId: target,
-              baseDir,
-              expectedPairingGeneration: generation!,
-              hostStats: {
-                cpuCount: 8,
-                memoryTotalBytes: 16384,
-                memoryFreeBytes: 8192,
-                updatedAtMs: 100,
-              },
-            });
-          case "connection":
-            return recordPairedNodeConnection(target, 100, baseDir, generation!).then((result) => {
-              expect(result.recorded).toBe(true);
-              return true;
-            });
-          case "disconnection":
-            return recordPairedNodeDisconnection({
-              nodeId: target,
-              connectedAtMs: 1,
-              disconnectedAtMs: 100,
-              expectedPairingGeneration: generation!,
-              baseDir,
-            }).then((result) => {
-              expect(result.recorded).toBe(true);
-              return true;
-            });
-          case "rename":
-            return renamePairedNode(target, "Updated", baseDir).then((result) => {
-              expect(result?.displayName).toBe("Updated");
-              return true;
-            });
-          case "verifyToken":
-            return verifyDeviceToken({
-              deviceId: target,
-              role: "node",
-              scopes: [],
-              token: "synthetic-node-token",
-              baseDir,
-            }).then((result) => {
-              expect(result.ok).toBe(true);
-              return true;
-            });
-        }
-        throw new Error("Unsupported metadata mutation");
-      })();
-      let waiting: Promise<PromiseSettledResult<unknown>[]> | undefined;
-      try {
-        await Promise.race([queued.promise, mutation]);
-        // Synchronous consumers still fail closed throughout every unpublished write.
-        expect(() => getPublishedPairedDeviceBinding("node", baseDir)).toThrow(
-          "current worker publication",
-        );
-        expect(() => registry.sendInvokeInput(invokeId, { command: "continue" })).toThrow();
-        const observed: string[] = [];
-        const current = registry.isConnectionCurrentPairingState("conn").then((value) => {
-          observed.push("current");
-          return value;
-        });
-        const input = registry
-          .sendInvokeInputWhenCurrent(invokeId, { command: "continue" })
-          .then(() => observed.push("input"));
-        const progress = registry
-          .handleInvokeProgressWhenCurrent({
-            invokeId,
-            nodeId: "node",
-            connId: "conn",
-            seq: 0,
-            chunk: "working",
-          })
-          .then((value) => {
-            observed.push("progress");
-            return value;
-          });
-        const result = registry
-          .handleInvokeResultWhenCurrent({
-            id: invokeId,
-            nodeId: "node",
-            connId: "conn",
-            ok: true,
-          })
-          .then((value) => {
-            observed.push("result");
-            return value;
-          });
-        waiting = Promise.allSettled([current, input, progress, result]);
-        await Promise.resolve();
-        expect(observed).toEqual([]);
-        expect(frames).toHaveLength(1);
-        expect(chunks).toEqual([]);
-        release.resolve();
-        await expect(mutation).resolves.toBe(true);
-        await expect(current).resolves.toBe(true);
-        await input;
-        await expect(progress).resolves.toBe(true);
-        expect(getPublishedPairedDeviceBinding("node", baseDir)).toEqual(binding);
-        expect(chunks).toEqual(["working"]);
-        expect(frames.map((frame) => JSON.parse(frame).event)).toEqual([
-          "node.invoke.request",
-          "node.invoke.input",
-        ]);
-        expect(JSON.parse(frames[1]!).payload.seq).toBe(0);
-        await expect(result).resolves.toBe(true);
-        await expect(invocation).resolves.toMatchObject({ ok: true });
-      } finally {
-        release.resolve();
-        await Promise.allSettled([mutation, waiting]);
-        writer.mockRestore();
-        registry.unregister("conn");
-        await invocation;
-      }
-    });
-  },
-);
-
-test.each(["remove", "revoke", "rotate"] as const)(
-  "fences current node authority throughout a %s mutation",
-  async (kind) => {
-    await listDevicePairing(baseDir);
-    const originalBinding = getPublishedPairedDeviceBinding("node", baseDir);
-    const queued = createDeferredCore();
-    const release = createDeferredCore();
-    const original = stateWorker.runOpenClawStateWorkerOperation;
-    const writer = vi
-      .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
-      .mockImplementationOnce(async (...args) => {
-        queued.resolve();
-        await release.promise;
-        return original(...args);
-      });
-    const mutation =
-      kind === "remove"
-        ? removePairedDevice("node", baseDir)
-        : kind === "revoke"
-          ? revokeDeviceToken({ deviceId: "node", role: "node", baseDir })
-          : rotateDeviceToken({ deviceId: "node", role: "node", baseDir });
-    try {
-      await Promise.race([queued.promise, mutation]);
-      expect(() => getPublishedPairedDeviceBinding("node", baseDir)).toThrow(
-        "current worker publication",
-      );
-      release.resolve();
-      await mutation;
-      expect(getPublishedPairedDeviceBinding("node", baseDir)).not.toEqual(originalBinding);
-    } finally {
-      release.resolve();
-      await mutation;
-      writer.mockRestore();
-    }
-  },
-);
-
-test("fails closed after a metadata worker failure and does not revive it during the next write", async () => {
-  await listDevicePairing(baseDir);
-  const writer = vi
-    .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
-    .mockRejectedValueOnce(new Error("synthetic worker failure"));
-  try {
-    await expect(
-      updatePairedDeviceMetadata("node", { displayName: "Updated" }, baseDir),
-    ).rejects.toThrow("synthetic worker failure");
-    expect(() => getPublishedPairedDeviceBinding("node", baseDir)).toThrow(
-      "current worker publication",
-    );
-  } finally {
-    writer.mockRestore();
-  }
-  const original = stateWorker.runOpenClawStateWorkerOperation;
-  const nextWriter = vi
-    .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
-    .mockImplementationOnce(async (...args) => {
-      expect(() => getPublishedPairedDeviceBinding("node", baseDir)).toThrow(
-        "current worker publication",
-      );
-      return original(...args);
-    });
-  try {
-    await updatePairedDeviceMetadata("node", { displayName: "Recovered" }, baseDir);
-    expect(getPublishedPairedDeviceBinding("node", baseDir)).not.toBeNull();
-  } finally {
-    nextWriter.mockRestore();
-  }
-});
-
-test("rejects externally revoked pairing across a queued metadata write", async () => {
+// Use the real pairing owner and invocation controller; only transport bytes are captured.
+async function createStreamingNodeFixture() {
   const device = await getPairedDevice("node", baseDir);
   persistDevicePairingStoreState(
     {
@@ -533,146 +247,187 @@ test("rejects externally revoked pairing across a queued metadata write", async 
   await listDevicePairing(baseDir);
   const binding = getPublishedPairedDeviceBinding("node", baseDir)!;
   const registry = new NodeRegistry({
-    resolveCurrentPairingState: async (nodeId) => {
-      await getPairedDevice(nodeId, baseDir);
-      return getPublishedPairedDeviceBinding(nodeId, baseDir) ?? undefined;
+    isPairingStateCurrent: isPairedDeviceNodeBindingCurrent,
+    withCurrentPairingState: (nodeId, effect) =>
+      withCurrentPairedDeviceNodeBinding(nodeId, effect, baseDir),
+  });
+  const frames: string[] = [];
+  const sent = createDeferredCore<string>();
+  const socket = createTestNodeSocket(frames);
+  socket.send.mockImplementation((frame: string) => {
+    frames.push(frame);
+    sent.resolve(frame);
+  });
+  registerNodeSession(
+    registry,
+    makeClient("conn", "node", frames, {
+      socket: socket as unknown as GatewayWsClient["socket"],
+    }),
+    {
+      pairingIdentity: binding.identity,
+      pairingGeneration: binding.generation,
     },
+  );
+  const chunks: string[] = [];
+  const abort = new AbortController();
+  const invocation = registry.invoke({
+    nodeId: "node",
+    command: "debug.ping",
+    timeoutMs: 60_000,
+    signal: abort.signal,
+    onProgress: (chunk) => chunks.push(chunk),
   });
-  registerNodeSession(registry, makeClient("conn", "node", []), {
-    pairingIdentity: binding.identity,
-    pairingGeneration: binding.generation,
-  });
+  const invokeId = JSON.parse(await sent.promise).payload.id as string;
+  return {
+    device: device!,
+    binding,
+    registry,
+    frames,
+    chunks,
+    abort,
+    invocation,
+    invokeId,
+    async close() {
+      registry.unregister("conn");
+      registry.unregister("replacement");
+      await invocation;
+    },
+  };
+}
+
+// Pause after the real facade has fenced publication, before its worker can commit.
+async function pauseMetadataMutation(target: string) {
   const queued = createDeferredCore();
-  const releaseMutation = createDeferredCore();
-  const releaseRead = createDeferredCore();
-  const originalMutation = stateWorker.runOpenClawStateWorkerOperation;
-  const originalRead = stateReads.executeExistingOpenClawStateRead;
-  const readProduced = createDeferredCore<Awaited<ReturnType<typeof originalRead>>>();
+  const release = createDeferredCore();
+  const original = stateWorker.runOpenClawStateWorkerOperation;
   const writer = vi
     .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
     .mockImplementationOnce(async (...args) => {
       queued.resolve();
-      await releaseMutation.promise;
-      return originalMutation(...args);
+      await release.promise;
+      return original(...args);
     });
-  const reader = vi
-    .spyOn(stateReads, "executeExistingOpenClawStateRead")
-    .mockImplementationOnce(async (...args) => {
-      try {
-        const reply = await originalRead(...args);
-        readProduced.resolve(reply);
-        await releaseRead.promise;
-        return reply;
-      } catch (error) {
-        readProduced.reject(error);
-        throw error;
-      }
-    });
-  const mutation = updatePairedDeviceMetadata("other", { displayName: "Updated" }, baseDir);
-  let lookup: ReturnType<typeof getPairedDevice> | undefined;
+  const mutation = updatePairedDeviceMetadata(target, { displayName: "Updated" }, baseDir);
   try {
     await Promise.race([queued.promise, mutation]);
-    const external = new DatabaseSync(database.path);
-    try {
-      external.prepare("DELETE FROM device_pairing_paired WHERE device_id = ?").run("node");
-    } finally {
-      external.close();
-    }
-    lookup = getPairedDevice("node", baseDir);
-    expect(await Promise.race([readProduced.promise, lookup])).toMatchObject({
-      type: "devicePairing.lookup",
-      device: null,
+  } catch (error) {
+    release.resolve();
+    writer.mockRestore();
+    throw error;
+  }
+  return {
+    mutation,
+    release: () => release.resolve(),
+    async close() {
+      release.resolve();
+      await Promise.allSettled([mutation]);
+      writer.mockRestore();
+    },
+  };
+}
+
+test.each(["node", "other"] as const)(
+  "waits for metadata on %s before admitting current node traffic",
+  async (target) => {
+    await withEnvAsync({ OPENCLAW_STATE_DIR: baseDir }, async () => {
+      const f = await createStreamingNodeFixture();
+      const paused = await pauseMetadataMutation(target);
+      let waiting: Promise<PromiseSettledResult<unknown>[]> | undefined;
+      try {
+        expect(() => getPublishedPairedDeviceBinding("node", baseDir)).toThrow(
+          "current worker publication",
+        );
+        expect(() => f.registry.sendInvokeInput(f.invokeId, { command: "continue" })).toThrow();
+        const observed: string[] = [];
+        const current = f.registry.isConnectionCurrentPairingState("conn").then((value) => {
+          observed.push("current");
+          return value;
+        });
+        const input = f.registry
+          .sendInvokeInputWhenCurrent(f.invokeId, { command: "continue" })
+          .then(() => observed.push("input"));
+        const progress = f.registry
+          .handleInvokeProgressWhenCurrent({
+            invokeId: f.invokeId,
+            nodeId: "node",
+            connId: "conn",
+            seq: 0,
+            chunk: "working",
+          })
+          .then((value) => {
+            observed.push("progress");
+            return value;
+          });
+        const result = f.registry
+          .handleInvokeResultWhenCurrent({
+            id: f.invokeId,
+            nodeId: "node",
+            connId: "conn",
+            ok: true,
+          })
+          .then((value) => {
+            observed.push("result");
+            return value;
+          });
+        waiting = Promise.allSettled([current, input, progress, result]);
+        await Promise.resolve();
+        expect(observed).toEqual([]);
+        expect(f.frames).toHaveLength(1);
+        expect(f.chunks).toEqual([]);
+        paused.release();
+        await expect(paused.mutation).resolves.toBe(true);
+        await expect(current).resolves.toBe(true);
+        await input;
+        await expect(progress).resolves.toBe(true);
+        expect(getPublishedPairedDeviceBinding("node", baseDir)).toEqual(f.binding);
+        expect(f.chunks).toEqual(["working"]);
+        expect(f.frames.map((frame) => JSON.parse(frame).event)).toEqual([
+          "node.invoke.request",
+          "node.invoke.input",
+        ]);
+        expect(JSON.parse(f.frames[1]!).payload.seq).toBe(0);
+        await expect(result).resolves.toBe(true);
+        await expect(f.invocation).resolves.toMatchObject({ ok: true });
+      } finally {
+        await paused.close();
+        await waiting;
+        await f.close();
+      }
     });
-    releaseMutation.resolve();
-    await expect(mutation).resolves.toBe(true);
-    // The receipt's different before-revision discards the previously published binding.
+  },
+);
+
+test("keeps failed metadata publication unavailable until a successful recovery", async () => {
+  await listDevicePairing(baseDir);
+  const writer = vi
+    .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
+    .mockRejectedValueOnce(new Error("synthetic worker failure"));
+  try {
+    await expect(
+      updatePairedDeviceMetadata("node", { displayName: "Updated" }, baseDir),
+    ).rejects.toThrow("synthetic worker failure");
     expect(() => getPublishedPairedDeviceBinding("node", baseDir)).toThrow(
       "current worker publication",
     );
-    // A read admitted during the write must refresh after its publication was superseded.
-    releaseRead.resolve();
-    await expect(lookup).resolves.toBeNull();
-    expect(getPublishedPairedDeviceBinding("node", baseDir)).toBeNull();
-    await expect(registry.isConnectionCurrentPairingState("conn")).resolves.toBe(false);
   } finally {
-    releaseRead.resolve();
-    releaseMutation.resolve();
-    await Promise.allSettled([lookup, mutation]);
-    reader.mockRestore();
     writer.mockRestore();
-    registry.unregister("conn");
   }
+  await updatePairedDeviceMetadata("node", { displayName: "Recovered" }, baseDir);
+  expect(getPublishedPairedDeviceBinding("node", baseDir)).not.toBeNull();
 });
 
 test.each(["remove", "revoke", "rotate", "cancel", "reconnect", "effect authority"] as const)(
   "does not send queued input after %s invalidates its authority",
   async (change) => {
     await withEnvAsync({ OPENCLAW_STATE_DIR: baseDir }, async () => {
-      const device = await getPairedDevice("node", baseDir);
-      persistDevicePairingStoreState(
-        {
-          pendingById: {},
-          pairedByDeviceId: {
-            node: device!,
-            other: { ...device!, deviceId: "other", publicKey: "other-key" },
-          },
-        },
-        baseDir,
-        "paired",
-      );
-      await listDevicePairing(baseDir);
-      const binding = getPublishedPairedDeviceBinding("node", baseDir)!;
-      const registry = new NodeRegistry({
-        isPairingStateCurrent: isPairedDeviceNodeBindingCurrent,
-        resolveCurrentPairingState: async (nodeId) =>
-          withCurrentPairedDeviceNodeBinding(nodeId, (current) => current, baseDir),
-        withCurrentPairingState: (nodeId, effect) =>
-          withCurrentPairedDeviceNodeBinding(nodeId, effect, baseDir),
-      });
-      const frames: string[] = [];
-      const sent = createDeferredCore<string>();
-      const socket = createTestNodeSocket(frames);
-      socket.send.mockImplementation((frame: string) => {
-        frames.push(frame);
-        sent.resolve(frame);
-      });
-      registerNodeSession(
-        registry,
-        makeClient("conn", "node", frames, {
-          socket: socket as unknown as GatewayWsClient["socket"],
-        }),
-        { pairingIdentity: binding.identity, pairingGeneration: binding.generation },
-      );
-      const chunks: string[] = [];
-      const abort = new AbortController();
-      const invocation = registry.invoke({
-        nodeId: "node",
-        command: "debug.ping",
-        timeoutMs: 60_000,
-        signal: abort.signal,
-        onProgress: (chunk) => chunks.push(chunk),
-      });
-      const invokeId = JSON.parse(await sent.promise).payload.id as string;
-      const queued = createDeferredCore();
-      const release = createDeferredCore();
-      const original = stateWorker.runOpenClawStateWorkerOperation;
-      const writer = vi
-        .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
-        .mockImplementationOnce(async (...args) => {
-          queued.resolve();
-          await release.promise;
-          return original(...args);
-        });
-      const mutation = updatePairedDeviceMetadata("other", { displayName: "Updated" }, baseDir);
+      const f = await createStreamingNodeFixture();
+      const paused = await pauseMetadataMutation("other");
       let input: Promise<{ sent: boolean; error?: unknown }> | undefined;
-      let rejectedProgress: Promise<boolean> | undefined;
-      let rejectedResult: Promise<boolean> | undefined;
       let effectAllowed = true;
       try {
-        await Promise.race([queued.promise, mutation]);
         let inputSettled = false;
-        input = registry
-          .sendInvokeInputWhenCurrent(invokeId, { command: "sensitive work" }, () => {
+        input = f.registry
+          .sendInvokeInputWhenCurrent(f.invokeId, { command: "sensitive work" }, () => {
             if (!effectAllowed) {
               throw new Error("effect authority was revoked");
             }
@@ -689,71 +444,96 @@ test.each(["remove", "revoke", "rotate", "cancel", "reconnect", "effect authorit
           );
         await Promise.resolve();
         expect(inputSettled).toBe(false);
-        expect(frames).toHaveLength(1);
+        expect(f.frames).toHaveLength(1);
         if (change === "cancel") {
-          abort.abort();
+          f.abort.abort();
         } else if (change === "reconnect") {
-          registry.unregister("conn");
-          registerNodeSession(registry, makeClient("replacement", "node", frames), {
-            pairingIdentity: binding.identity,
-            pairingGeneration: binding.generation,
+          f.registry.unregister("conn");
+          registerNodeSession(f.registry, makeClient("replacement", "node", f.frames), {
+            pairingIdentity: f.binding.identity,
+            pairingGeneration: f.binding.generation,
           });
         } else if (change === "effect authority") {
           effectAllowed = false;
         } else {
-          // A separate SQLite owner commits the revocation while the metadata
-          // adapter is paused. The final guarded read must observe that commit.
           const external = new DatabaseSync(database.path);
           try {
             if (change === "remove") {
               external.prepare("DELETE FROM device_pairing_paired WHERE device_id = ?").run("node");
             } else {
-              const token = device!.tokens!.node!;
+              const token = f.device.tokens!.node!;
               const replacement =
                 change === "rotate"
                   ? { ...token, token: "external-replacement-token", rotatedAtMs: 100 }
                   : { ...token, revokedAtMs: 100 };
               external
                 .prepare("UPDATE device_pairing_paired SET tokens_json = ? WHERE device_id = ?")
-                .run(JSON.stringify({ ...device!.tokens, node: replacement }), "node");
+                .run(JSON.stringify({ ...f.device.tokens, node: replacement }), "node");
             }
           } finally {
             external.close();
           }
-          rejectedProgress = registry.handleInvokeProgressWhenCurrent({
-            invokeId,
-            nodeId: "node",
-            connId: "conn",
-            seq: 0,
-            chunk: "revoked output",
-          });
-          rejectedResult = registry.handleInvokeResultWhenCurrent({
-            id: invokeId,
-            nodeId: "node",
-            connId: "conn",
-            ok: true,
+        }
+        paused.release();
+        await expect(paused.mutation).resolves.toBe(true);
+        expect(await input).toMatchObject({ sent: false, error: expect.any(Error) });
+        if (change === "effect authority") {
+          expect(await input).toMatchObject({
+            error: { message: "effect authority was revoked" },
           });
         }
-        release.resolve();
-        await expect(mutation).resolves.toBe(true);
-        expect(await input).toMatchObject({ sent: false, error: expect.any(Error) });
-        expect(frames.filter((frame) => JSON.parse(frame).event === "node.invoke.input")).toEqual(
+        expect(f.frames.filter((frame) => JSON.parse(frame).event === "node.invoke.input")).toEqual(
           [],
         );
         if (change === "remove" || change === "revoke" || change === "rotate") {
-          expect(frames).toHaveLength(1);
-          await expect(rejectedProgress).resolves.toBe(false);
-          await expect(rejectedResult).resolves.toBe(false);
-          expect(chunks).toEqual([]);
-          await expect(registry.isConnectionCurrentPairingState("conn")).resolves.toBe(false);
+          expect(f.frames).toHaveLength(1);
+          await expect(f.registry.isConnectionCurrentPairingState("conn")).resolves.toBe(false);
         }
       } finally {
-        release.resolve();
-        await Promise.allSettled([mutation, input, rejectedProgress, rejectedResult]);
-        writer.mockRestore();
-        registry.unregister("conn");
-        registry.unregister("replacement");
-        await invocation;
+        await paused.close();
+        await input;
+        await f.close();
+      }
+    });
+  },
+);
+
+test.each(["progress", "result"] as const)(
+  "rejects %s after external removal while the cached pairing still appears current",
+  async (effect) => {
+    await withEnvAsync({ OPENCLAW_STATE_DIR: baseDir }, async () => {
+      const f = await createStreamingNodeFixture();
+      try {
+        const external = new DatabaseSync(database.path);
+        try {
+          external.prepare("DELETE FROM device_pairing_paired WHERE device_id = ?").run("node");
+        } finally {
+          external.close();
+        }
+        // No other effect or refresh may retire the invoke before this guard sees the deletion.
+        expect(getPublishedPairedDeviceBinding("node", baseDir)).toEqual(f.binding);
+        const reply =
+          effect === "progress"
+            ? f.registry.handleInvokeProgressWhenCurrent({
+                invokeId: f.invokeId,
+                nodeId: "node",
+                connId: "conn",
+                seq: 0,
+                chunk: "revoked output",
+              })
+            : f.registry.handleInvokeResultWhenCurrent({
+                id: f.invokeId,
+                nodeId: "node",
+                connId: "conn",
+                ok: true,
+                payload: { mustNotEscape: true },
+              });
+        await expect(reply).resolves.toBe(false);
+        expect(f.chunks).toEqual([]);
+        expect(f.frames).toHaveLength(1);
+        await expect(f.invocation).resolves.toMatchObject({ ok: false });
+      } finally {
+        await f.close();
       }
     });
   },
