@@ -21,6 +21,7 @@ import {
   captureNodePairingGeneration,
   isNodePairingGenerationCurrent,
   isPairedDeviceNodeBindingCurrent,
+  withCurrentPairedDeviceNodeBinding,
 } from "./device-pairing-node-state.js";
 import {
   recordPairedNodeHostStats,
@@ -259,7 +260,7 @@ test.each([
   { kind: "verifyToken", target: "node" },
   { kind: "verifyToken", target: "other" },
 ] as const)(
-  "keeps a node invocation usable during a $kind mutation on $target",
+  "waits for a $kind mutation on $target before admitting current node traffic",
   async ({ kind, target }) => {
     await withEnvAsync({ OPENCLAW_STATE_DIR: baseDir }, async () => {
       const device = await getPairedDevice("node", baseDir);
@@ -279,7 +280,10 @@ test.each([
       const generation = await captureNodePairingGeneration(target);
       const registry = new NodeRegistry({
         isPairingStateCurrent: isPairedDeviceNodeBindingCurrent,
-        resolveCurrentPairingState: async () => binding,
+        resolveCurrentPairingState: async (nodeId) =>
+          withCurrentPairedDeviceNodeBinding(nodeId, (current) => current, baseDir),
+        withCurrentPairingState: (nodeId, effect) =>
+          withCurrentPairedDeviceNodeBinding(nodeId, effect, baseDir),
       });
       const frames: string[] = [];
       const sent = createDeferredCore<string>();
@@ -375,34 +379,67 @@ test.each([
         }
         throw new Error("Unsupported metadata mutation");
       })();
+      let waiting: Promise<PromiseSettledResult<unknown>[]> | undefined;
       try {
         await Promise.race([queued.promise, mutation]);
-        // This is the inbound RPC gate before node.invoke.progress is dispatched.
-        await expect.soft(registry.isConnectionCurrentPairingState("conn")).resolves.toBe(true);
-        expect
-          .soft(() => registry.sendInvokeInput(invokeId, { command: "continue" }))
-          .not.toThrow();
-        expect(
-          registry.handleInvokeProgress({
+        // Synchronous consumers still fail closed throughout every unpublished write.
+        expect(() => getPublishedPairedDeviceBinding("node", baseDir)).toThrow(
+          "current worker publication",
+        );
+        expect(() => registry.sendInvokeInput(invokeId, { command: "continue" })).toThrow();
+        const observed: string[] = [];
+        const current = registry.isConnectionCurrentPairingState("conn").then((value) => {
+          observed.push("current");
+          return value;
+        });
+        const input = registry
+          .sendInvokeInputWhenCurrent(invokeId, { command: "continue" })
+          .then(() => observed.push("input"));
+        const progress = registry
+          .handleInvokeProgressWhenCurrent({
             invokeId,
             nodeId: "node",
             connId: "conn",
             seq: 0,
             chunk: "working",
-          }),
-        ).toBe(true);
-        expect(chunks).toEqual(["working"]);
-        expect(frames.map((frame) => JSON.parse(frame).event)).toContain("node.invoke.input");
+          })
+          .then((value) => {
+            observed.push("progress");
+            return value;
+          });
+        const result = registry
+          .handleInvokeResultWhenCurrent({
+            id: invokeId,
+            nodeId: "node",
+            connId: "conn",
+            ok: true,
+          })
+          .then((value) => {
+            observed.push("result");
+            return value;
+          });
+        waiting = Promise.allSettled([current, input, progress, result]);
+        await Promise.resolve();
+        expect(observed).toEqual([]);
+        expect(frames).toHaveLength(1);
+        expect(chunks).toEqual([]);
         release.resolve();
         await expect(mutation).resolves.toBe(true);
+        await expect(current).resolves.toBe(true);
+        await input;
+        await expect(progress).resolves.toBe(true);
         expect(getPublishedPairedDeviceBinding("node", baseDir)).toEqual(binding);
-        expect(
-          registry.handleInvokeResult({ id: invokeId, nodeId: "node", connId: "conn", ok: true }),
-        ).toBe(true);
+        expect(chunks).toEqual(["working"]);
+        expect(frames.map((frame) => JSON.parse(frame).event)).toEqual([
+          "node.invoke.request",
+          "node.invoke.input",
+        ]);
+        expect(JSON.parse(frames[1]!).payload.seq).toBe(0);
+        await expect(result).resolves.toBe(true);
         await expect(invocation).resolves.toMatchObject({ ok: true });
       } finally {
         release.resolve();
-        await mutation;
+        await Promise.allSettled([mutation, waiting]);
         writer.mockRestore();
         registry.unregister("conn");
         await invocation;
@@ -566,3 +603,158 @@ test("rejects externally revoked pairing across a queued metadata write", async 
     registry.unregister("conn");
   }
 });
+
+test.each(["remove", "revoke", "rotate", "cancel", "reconnect", "effect authority"] as const)(
+  "does not send queued input after %s invalidates its authority",
+  async (change) => {
+    await withEnvAsync({ OPENCLAW_STATE_DIR: baseDir }, async () => {
+      const device = await getPairedDevice("node", baseDir);
+      persistDevicePairingStoreState(
+        {
+          pendingById: {},
+          pairedByDeviceId: {
+            node: device!,
+            other: { ...device!, deviceId: "other", publicKey: "other-key" },
+          },
+        },
+        baseDir,
+        "paired",
+      );
+      await listDevicePairing(baseDir);
+      const binding = getPublishedPairedDeviceBinding("node", baseDir)!;
+      const registry = new NodeRegistry({
+        isPairingStateCurrent: isPairedDeviceNodeBindingCurrent,
+        resolveCurrentPairingState: async (nodeId) =>
+          withCurrentPairedDeviceNodeBinding(nodeId, (current) => current, baseDir),
+        withCurrentPairingState: (nodeId, effect) =>
+          withCurrentPairedDeviceNodeBinding(nodeId, effect, baseDir),
+      });
+      const frames: string[] = [];
+      const sent = createDeferredCore<string>();
+      const socket = createTestNodeSocket(frames);
+      socket.send.mockImplementation((frame: string) => {
+        frames.push(frame);
+        sent.resolve(frame);
+      });
+      registerNodeSession(
+        registry,
+        makeClient("conn", "node", frames, {
+          socket: socket as unknown as GatewayWsClient["socket"],
+        }),
+        { pairingIdentity: binding.identity, pairingGeneration: binding.generation },
+      );
+      const chunks: string[] = [];
+      const abort = new AbortController();
+      const invocation = registry.invoke({
+        nodeId: "node",
+        command: "debug.ping",
+        timeoutMs: 60_000,
+        signal: abort.signal,
+        onProgress: (chunk) => chunks.push(chunk),
+      });
+      const invokeId = JSON.parse(await sent.promise).payload.id as string;
+      const queued = createDeferredCore();
+      const release = createDeferredCore();
+      const original = stateWorker.runOpenClawStateWorkerOperation;
+      const writer = vi
+        .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
+        .mockImplementationOnce(async (...args) => {
+          queued.resolve();
+          await release.promise;
+          return original(...args);
+        });
+      const mutation = updatePairedDeviceMetadata("other", { displayName: "Updated" }, baseDir);
+      let input: Promise<{ sent: boolean; error?: unknown }> | undefined;
+      let rejectedProgress: Promise<boolean> | undefined;
+      let rejectedResult: Promise<boolean> | undefined;
+      let effectAllowed = true;
+      try {
+        await Promise.race([queued.promise, mutation]);
+        let inputSettled = false;
+        input = registry
+          .sendInvokeInputWhenCurrent(invokeId, { command: "sensitive work" }, () => {
+            if (!effectAllowed) {
+              throw new Error("effect authority was revoked");
+            }
+          })
+          .then(
+            () => {
+              inputSettled = true;
+              return { sent: true };
+            },
+            (error: unknown) => {
+              inputSettled = true;
+              return { sent: false, error };
+            },
+          );
+        await Promise.resolve();
+        expect(inputSettled).toBe(false);
+        expect(frames).toHaveLength(1);
+        if (change === "cancel") {
+          abort.abort();
+        } else if (change === "reconnect") {
+          registry.unregister("conn");
+          registerNodeSession(registry, makeClient("replacement", "node", frames), {
+            pairingIdentity: binding.identity,
+            pairingGeneration: binding.generation,
+          });
+        } else if (change === "effect authority") {
+          effectAllowed = false;
+        } else {
+          // A separate SQLite owner commits the revocation while the metadata
+          // adapter is paused. The final guarded read must observe that commit.
+          const external = new DatabaseSync(database.path);
+          try {
+            if (change === "remove") {
+              external.prepare("DELETE FROM device_pairing_paired WHERE device_id = ?").run("node");
+            } else {
+              const token = device!.tokens!.node!;
+              const replacement =
+                change === "rotate"
+                  ? { ...token, token: "external-replacement-token", rotatedAtMs: 100 }
+                  : { ...token, revokedAtMs: 100 };
+              external
+                .prepare("UPDATE device_pairing_paired SET tokens_json = ? WHERE device_id = ?")
+                .run(JSON.stringify({ ...device!.tokens, node: replacement }), "node");
+            }
+          } finally {
+            external.close();
+          }
+          rejectedProgress = registry.handleInvokeProgressWhenCurrent({
+            invokeId,
+            nodeId: "node",
+            connId: "conn",
+            seq: 0,
+            chunk: "revoked output",
+          });
+          rejectedResult = registry.handleInvokeResultWhenCurrent({
+            id: invokeId,
+            nodeId: "node",
+            connId: "conn",
+            ok: true,
+          });
+        }
+        release.resolve();
+        await expect(mutation).resolves.toBe(true);
+        expect(await input).toMatchObject({ sent: false, error: expect.any(Error) });
+        expect(frames.filter((frame) => JSON.parse(frame).event === "node.invoke.input")).toEqual(
+          [],
+        );
+        if (change === "remove" || change === "revoke" || change === "rotate") {
+          expect(frames).toHaveLength(1);
+          await expect(rejectedProgress).resolves.toBe(false);
+          await expect(rejectedResult).resolves.toBe(false);
+          expect(chunks).toEqual([]);
+          await expect(registry.isConnectionCurrentPairingState("conn")).resolves.toBe(false);
+        }
+      } finally {
+        release.resolve();
+        await Promise.allSettled([mutation, input, rejectedProgress, rejectedResult]);
+        writer.mockRestore();
+        registry.unregister("conn");
+        registry.unregister("replacement");
+        await invocation;
+      }
+    });
+  },
+);

@@ -126,12 +126,9 @@ export function captureDevicePairingPublication(admission: OpenClawStateDatabase
       captured.blocked = false;
       return true;
     },
-    beginMutation(options: { preservesBindings?: boolean } = {}) {
+    beginMutation() {
       captured.epoch++;
-      // Presence and display metadata cannot change node authority. Keep its
-      // last committed publication usable while those worker writes are pending.
-      // Never revive a publication already blocked by a failed read or mutation.
-      captured.blocked ||= !options.preservesBindings;
+      captured.blocked = true;
       const mutation = {};
       captured.mutation = mutation;
       return {
