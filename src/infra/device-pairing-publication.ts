@@ -126,9 +126,12 @@ export function captureDevicePairingPublication(admission: OpenClawStateDatabase
       captured.blocked = false;
       return true;
     },
-    beginMutation() {
+    beginMutation(options: { preservesBindings?: boolean } = {}) {
       captured.epoch++;
-      captured.blocked = true;
+      // Presence and display metadata cannot change node authority. Keep its
+      // last committed publication usable while those worker writes are pending.
+      // Never revive a publication already blocked by a failed read or mutation.
+      captured.blocked ||= !options.preservesBindings;
       const mutation = {};
       captured.mutation = mutation;
       return {
@@ -148,9 +151,14 @@ export function captureDevicePairingPublication(admission: OpenClawStateDatabase
           captured.epoch++;
         },
         finish(settled: boolean) {
-          if (settled && captured.mutation === mutation) {
-            captured.mutation = undefined;
-            captured.epoch++;
+          if (captured.mutation === mutation) {
+            // Without a commit receipt, even a metadata write may have observed
+            // an external revision or lost its database authority. Fail closed.
+            captured.blocked = true;
+            if (settled) {
+              captured.mutation = undefined;
+              captured.epoch++;
+            }
           }
         },
       };
