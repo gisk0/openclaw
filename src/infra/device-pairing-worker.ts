@@ -129,7 +129,18 @@ export function executeDevicePairingMutation<Key extends keyof DevicePairingWork
     context.admission.assertCurrent();
     options.assertCurrent?.();
     const publication = captureDevicePairingPublication(context.admission);
-    const mutation = publication.beginMutation();
+    const mutation = publication.beginMutation({
+      // The kernels explicitly allowlist non-auth fields for these operations.
+      // All other mutations retain the authority fence, including future ones.
+      preservesBindings:
+        captured.type === "devicePairing.updateMetadata" ||
+        captured.type === "devicePairing.updatePresence" ||
+        captured.type === "node.recordHostStats" ||
+        captured.type === "node.recordConnection" ||
+        captured.type === "node.recordDisconnection" ||
+        captured.type === "node.rename" ||
+        captured.type === "devicePairing.verifyToken",
+    });
     let admission: SqliteWorkerOperationAdmission | undefined;
     let published = false;
     let publishEnvironment: ReturnType<typeof reserveWorkerEnvironmentNativePublication>;
